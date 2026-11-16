@@ -51,7 +51,7 @@ class RupeeVaultWidget : GlanceAppWidget() {
                 .clickable(actionStartActivity<MainActivity>())
         ) {
             Text(
-                text = "RupeeVault X • Live Xbox IN ₹",
+                text = "RupeeVault X • Live Microsoft IN ₹",
                 style = TextStyle(
                     color = ColorProvider(Color(0xFF10B981)),
                     fontWeight = FontWeight.Bold,
@@ -77,7 +77,12 @@ class RupeeVaultWidget : GlanceAppWidget() {
                             style = TextStyle(color = ColorProvider(Color.White), fontSize = 12.sp)
                         )
                         Spacer(modifier = GlanceModifier.width(8.dp))
-                        val tag = if (priceInr == 0) "FREE" else if (discountPct > 0) "₹$priceInr (-$discountPct%)" else "₹$priceInr"
+                        val tag = when {
+                            priceInr < 0 -> "SOON"
+                            priceInr == 0 -> "FREE"
+                            discountPct > 0 -> "₹$priceInr (-$discountPct%)"
+                            else -> "₹$priceInr"
+                        }
                         Text(
                             text = tag,
                             style = TextStyle(

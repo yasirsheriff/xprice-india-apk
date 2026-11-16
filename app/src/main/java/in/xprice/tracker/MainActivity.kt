@@ -1,11 +1,16 @@
 package `in`.xprice.tracker
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -70,8 +75,11 @@ import coil.compose.AsyncImage
 import `in`.xprice.tracker.data.*
 import `in`.xprice.tracker.widget.RupeeVaultWidget
 import `in`.xprice.tracker.worker.PriceAlertWorker
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.net.URLDecoder
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
@@ -105,6 +113,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+fun formatStorePriceLabel(priceInr: Int): String {
+    return when {
+        priceInr < 0 -> "COMING SOON"
+        priceInr == 0 -> "FREE"
+        else -> "₹$priceInr"
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RupeeVaultMainScreen() {
@@ -112,9 +128,9 @@ fun RupeeVaultMainScreen() {
     val repository = remember { XboxStoreRepository(context) }
     val newsRepository = remember { XboxNewsRepository(context) }
     val storage = remember { PriceHistoryStorage(context) }
+    val authManager = remember { XboxLiveAuthManager() }
     val scope = rememberCoroutineScope()
 
-    // 0 = All Games | 1 = New Launches | 2 = Hot Deals | 3 = Game Pass | 4 = Xbox News | 5 = Xbox Profile & Stats
     var activeTab by remember { mutableIntStateOf(0) }
 
     var allGamesList by remember { mutableStateOf(repository.getInstantCache("cache_all_games")) }
@@ -126,22 +142,21 @@ fun RupeeVaultMainScreen() {
 
     var xboxProfile by remember { mutableStateOf(storage.getXboxProfile()) }
     var ownedVaultMap by remember { mutableStateOf(storage.getOwnedVault()) }
+    var showXboxOAuthWebView by remember { mutableStateOf(false) }
 
-    var isLoading by remember { mutableStateOf(true) }
+    var isLoading by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
 
-    // View Mode Dropdown State
     var viewMode by remember { mutableStateOf(ViewLayoutMode.DETAILED) }
     var showViewDropdown by remember { mutableStateOf(false) }
 
-    // Separate Filter & Sort Modal States (Only applies when user clicks "Apply")
     var showFilterModal by remember { mutableStateOf(false) }
     var showSortModal by remember { mutableStateOf(false) }
 
     var appliedDealFilter by remember { mutableStateOf("Everything") }
     var appliedGenreFilter by remember { mutableStateOf("All Genres") }
     var appliedRatingFilter by remember { mutableStateOf("Any ★") }
-    var appliedMaxPriceInr by remember { mutableIntStateOf(6000) }
+    var appliedMaxPriceInr by remember { mutableIntStateOf(8000) }
     var appliedSortOption by remember { mutableStateOf("Popular") }
 
     var compareSelection by remember { mutableStateOf<List<XboxGameDeal>>(emptyList()) }
@@ -158,7 +173,7 @@ fun RupeeVaultMainScreen() {
         if (appliedDealFilter != "Everything") count++
         if (appliedGenreFilter != "All Genres") count++
         if (appliedRatingFilter != "Any ★") count++
-        if (appliedMaxPriceInr < 6000) count++
+        if (appliedMaxPriceInr < 8000) count++
         count
     }
 
@@ -176,14 +191,14 @@ fun RupeeVaultMainScreen() {
         }
     }
 
-    fun refreshActiveTab() {
+    fun refreshActiveTab(forceNetwork: Boolean = false) {
         isLoading = true
         scope.launch {
             when (activeTab) {
-                0 -> repository.fetchAllXboxIndiaGames().onSuccess { allGamesList = it }
-                1 -> repository.fetchNewLaunchesIndia().onSuccess { newLaunchesList = it }
-                2 -> repository.fetchHotDealsIndia().onSuccess { hotDealsList = it }
-                3 -> repository.fetchGamePassIndiaCatalog().onSuccess { gamePassList = it }
+                0 -> repository.fetchAllXboxIndiaGames(forceNetwork).onSuccess { allGamesList = it }
+                1 -> repository.fetchNewLaunchesIndia(forceNetwork).onSuccess { newLaunchesList = it }
+                2 -> repository.fetchHotDealsIndia(forceNetwork).onSuccess { hotDealsList = it }
+                3 -> repository.fetchGamePassIndiaCatalog(forceNetwork).onSuccess { gamePassList = it }
                 4 -> newsRepository.fetchLiveXboxWireNews().onSuccess { newsArticles = it }
                 5 -> {
                     xboxProfile = storage.getXboxProfile()
@@ -197,7 +212,7 @@ fun RupeeVaultMainScreen() {
     }
 
     LaunchedEffect(activeTab) {
-        refreshActiveTab()
+        refreshActiveTab(forceNetwork = false)
     }
 
     LaunchedEffect(searchQuery) {
@@ -208,7 +223,7 @@ fun RupeeVaultMainScreen() {
             return@LaunchedEffect
         }
         isLoading = true
-        delay(250)
+        delay(220)
         repository.searchLiveXboxIndiaCatalog(q).onSuccess {
             searchResults = it
             isLoading = false
@@ -288,7 +303,7 @@ fun RupeeVaultMainScreen() {
         }.let { list ->
             when (appliedSortOption) {
                 "Best Discount" -> list.sortedByDescending { it.discountPercent }
-                "Lowest ₹" -> list.sortedBy { it.currentPriceInr }
+                "Lowest ₹" -> list.sortedBy { if (it.currentPriceInr < 0) Int.MAX_VALUE else it.currentPriceInr }
                 "Highest ₹" -> list.sortedByDescending { it.currentPriceInr }
                 "Top Rated ★" -> list.sortedByDescending { it.starRating }
                 else -> list
@@ -321,7 +336,6 @@ fun RupeeVaultMainScreen() {
                     }
                 },
                 actions = {
-                    // Compact View Mode Dropdown Selector
                     if (activeTab < 4) {
                         Box {
                             OutlinedButton(
@@ -377,7 +391,6 @@ fun RupeeVaultMainScreen() {
                 .padding(padding)
                 .padding(horizontal = 14.dp)
         ) {
-            // 6-Tab Navigation Row including Xbox Profile & Playtime Stats
             ScrollableTabRow(
                 selectedTabIndex = activeTab,
                 containerColor = Color(0xFF131823),
@@ -396,27 +409,13 @@ fun RupeeVaultMainScreen() {
             Spacer(modifier = Modifier.height(10.dp))
 
             if (activeTab == 5) {
-                // =========================================================
-                // TAB 5: XBOX LIVE LOGIN, OWNED SPENDING & PLAYTIME STATS HUB
-                // =========================================================
                 XboxProfileAndStatsScreen(
                     profile = xboxProfile,
                     ownedEntries = ownedVaultMap.values.toList(),
                     allKnownGames = (allGamesList + hotDealsList + gamePassList).distinctBy { it.productId },
                     storage = storage,
-                    onConnectXbox = { gamertag, apiKey ->
-                        isLoading = true
-                        scope.launch {
-                            xboxProfile = storage.syncXboxLiveAccount(
-                                gamertagInput = gamertag,
-                                apiKeyInput = apiKey,
-                                catalogGames = (allGamesList + hotDealsList).distinctBy { it.productId }
-                            )
-                            ownedVaultMap = storage.getOwnedVault()
-                            isLoading = false
-                            Toast.makeText(context, "🎮 Xbox Account Synced: ${xboxProfile.gamertag}", Toast.LENGTH_SHORT).show()
-                        }
-                    },
+                    isSyncing = isLoading,
+                    onLaunchMicrosoftOAuth = { showXboxOAuthWebView = true },
                     onDisconnectXbox = {
                         storage.disconnectXboxProfile()
                         xboxProfile = storage.getXboxProfile()
@@ -427,14 +426,13 @@ fun RupeeVaultMainScreen() {
                     }
                 )
             } else {
-                // Search Bar + Clean Separate Filter & Sort Trigger Bar
                 OutlinedTextField(
                     value = searchQuery,
                     onValueChange = { searchQuery = it },
                     placeholder = {
                         Text(
                             text = if (activeTab == 4) "Search official Xbox Wire headlines..."
-                            else "Search all Xbox India games (Halo, Forza, FIFA, Indie)...",
+                            else "Search Microsoft Store India (GTA, Halo, Forza, Elden Ring)...",
                             fontSize = 13.sp
                         )
                     },
@@ -446,8 +444,8 @@ fun RupeeVaultMainScreen() {
                                     Icon(Icons.Default.Clear, contentDescription = "Clear")
                                 }
                             }
-                            IconButton(onClick = { refreshActiveTab() }) {
-                                Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Color(0xFF10B981))
+                            IconButton(onClick = { refreshActiveTab(forceNetwork = true) }) {
+                                Icon(Icons.Default.Refresh, contentDescription = "Force Refresh", tint = Color(0xFF10B981))
                             }
                         }
                     },
@@ -485,7 +483,6 @@ fun RupeeVaultMainScreen() {
                         }
                     }
                 } else {
-                    // Type-Ahead Live Match Strip
                     if (searchQuery.trim().length >= 2 && activeSourceGames.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(6.dp))
                         Row(
@@ -498,7 +495,7 @@ fun RupeeVaultMainScreen() {
                                 SuggestionChip(
                                     onClick = { selectedGame = suggestion },
                                     label = {
-                                        val priceTag = if (suggestion.currentPriceInr == 0) "FREE" else "₹${suggestion.currentPriceInr}"
+                                        val priceTag = formatStorePriceLabel(suggestion.currentPriceInr)
                                         Text("${suggestion.title} • $priceTag", fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
                                 )
@@ -508,7 +505,6 @@ fun RupeeVaultMainScreen() {
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Clean Compact Filter & Sort Action Bar (Replaces cluttered inline chip rows)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -613,7 +609,68 @@ fun RupeeVaultMainScreen() {
             }
         }
 
-        // Separate Filter Modal Sheet (Stages selections & only modifies list when "Apply Filters" is tapped)
+        // In-App Official Microsoft Xbox Live OAuth 2.0 WebView Login Dialog
+        if (showXboxOAuthWebView) {
+            XboxOAuthLoginWebViewDialog(
+                onDismiss = { showXboxOAuthWebView = false },
+                onTokenCaptured = { accessToken ->
+                    showXboxOAuthWebView = false
+                    isLoading = true
+                    scope.launch {
+                        val syncRes = authManager.authenticateAndFetchLibrary(accessToken)
+                        syncRes.onSuccess { authData ->
+                            storage.saveXboxProfile(
+                                gamertag = authData.gamertag,
+                                xuid = authData.xuid,
+                                gamerscore = authData.gamerscore,
+                                tier = "Xbox Live Verified"
+                            )
+                            // Cross-reference owned ProductIds with Microsoft DisplayCatalog IN for real INR prices
+                            val validBigIds = authData.titles.mapNotNull { t ->
+                                t.productId.takeIf { it.length == 12 }
+                            }.distinct()
+
+                            val pricedMap = withContext(Dispatchers.IO) {
+                                val list = mutableListOf<XboxGameDeal>()
+                                validBigIds.chunked(20).forEach { chunk ->
+                                    list.addAll(repository.fetchCatalogByBigIds(chunk))
+                                }
+                                list.associateBy { it.productId }
+                            }
+
+                            authData.titles.forEach { t ->
+                                val storeMatch = pricedMap[t.productId]
+                                val liveInr = storeMatch?.currentPriceInr?.coerceAtLeast(0) ?: 0
+                                val mrpInr = storeMatch?.mrpInr?.coerceAtLeast(liveInr) ?: liveInr
+                                val hrs = (t.minutesPlayed / 60.0 * 10.0).roundToInt() / 10.0
+                                val achPct = if (t.maxGamerscore > 0) ((t.currentGamerscore.toDouble() / t.maxGamerscore) * 100.0).roundToInt() else 0
+                                storage.markGameOwned(
+                                    productId = t.productId.ifBlank { t.titleId },
+                                    title = t.name,
+                                    paidInr = liveInr,
+                                    mrpInr = mrpInr,
+                                    hoursPlayed = hrs,
+                                    achievementsPct = achPct
+                                )
+                            }
+
+                            xboxProfile = storage.getXboxProfile()
+                            ownedVaultMap = storage.getOwnedVault()
+                            isLoading = false
+                            Toast.makeText(
+                                context,
+                                "✅ Synced ${authData.titles.size} Xbox games for ${authData.gamertag}!",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }.onFailure { err ->
+                            isLoading = false
+                            Toast.makeText(context, "Xbox Sync Notice: ${err.message}", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+            )
+        }
+
         if (showFilterModal) {
             var tempDeal by remember { mutableStateOf(appliedDealFilter) }
             var tempGenre by remember { mutableStateOf(appliedGenreFilter) }
@@ -655,8 +712,8 @@ fun RupeeVaultMainScreen() {
                     Slider(
                         value = tempMaxPrice,
                         onValueChange = { tempMaxPrice = it },
-                        valueRange = 500f..6000f,
-                        steps = 10
+                        valueRange = 500f..8000f,
+                        steps = 14
                     )
 
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -665,7 +722,7 @@ fun RupeeVaultMainScreen() {
                                 appliedDealFilter = "Everything"
                                 appliedGenreFilter = "All Genres"
                                 appliedRatingFilter = "Any ★"
-                                appliedMaxPriceInr = 6000
+                                appliedMaxPriceInr = 8000
                                 showFilterModal = false
                             },
                             modifier = Modifier.weight(1f)
@@ -691,7 +748,6 @@ fun RupeeVaultMainScreen() {
             }
         }
 
-        // Separate Sort Modal Sheet (Only applies when user clicks "Apply Sort")
         if (showSortModal) {
             var tempSort by remember { mutableStateOf(appliedSortOption) }
             ModalBottomSheet(
@@ -751,7 +807,7 @@ fun RupeeVaultMainScreen() {
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("RupeeVault X", fontWeight = FontWeight.Black, color = Color(0xFF10B981))
-                        Text(" • v5.0 Ultimate", fontSize = 14.sp, color = Color.Gray)
+                        Text(" • v6.0 Real-API", fontSize = 14.sp, color = Color.Gray)
                     }
                 },
                 text = {
@@ -762,7 +818,7 @@ fun RupeeVaultMainScreen() {
                         Text("Salem, Tamil Nadu, India", fontSize = 12.sp, color = Color.LightGray)
                         HorizontalDivider(color = Color(0xFF263042))
                         Text(
-                            "Complete Xbox India Store analytics engine with Xbox Live Account & Playtime telemetry, Spent vs. MRP ROI tracking, 1M/1Y/All-Time price history charts, and automated price drop alerts.",
+                            "100% Real Microsoft DisplayCatalog India pricing engine with parallel OkHttp connection pooling, official Microsoft Xbox OAuth 2.0 TitleHub library & playtime sync, and real INR price history snapshots.",
                             fontSize = 12.sp,
                             color = Color.LightGray
                         )
@@ -815,7 +871,7 @@ fun RupeeVaultMainScreen() {
                     onSaveAlert = { targetInr ->
                         storage.setPriceAlert(game.productId, game.title, targetInr)
                         Toast.makeText(context, "🔔 Alert set for ₹$targetInr!", Toast.LENGTH_SHORT).show()
-                        if (game.currentPriceInr <= targetInr) {
+                        if (game.currentPriceInr in 1..targetInr) {
                             PriceAlertWorker.sendPriceDropNotification(
                                 context, game.productId, game.title, game.currentPriceInr, targetInr, game.storeUrl
                             )
@@ -836,6 +892,86 @@ fun RupeeVaultMainScreen() {
 }
 
 // =========================================================================
+// IN-APP MICROSOFT XBOX LIVE OAUTH 2.0 WEBVIEW LOGIN DIALOG
+// =========================================================================
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun XboxOAuthLoginWebViewDialog(
+    onDismiss: () -> Unit,
+    onTokenCaptured: (String) -> Unit
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFF090C12))
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF131823))
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("Sign in with Microsoft Xbox", fontWeight = FontWeight.Black, fontSize = 16.sp, color = Color(0xFF10B981))
+                    Text("Official login.live.com OAuth 2.0 • Syncs Owned Games & Hours", fontSize = 11.sp, color = Color.LightGray)
+                }
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
+                }
+            }
+
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.allowFileAccess = false
+                        settings.allowContentAccess = false
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                                super.onPageStarted(view, url, favicon)
+                                if (url != null && url.contains("access_token=")) {
+                                    val tokenPart = url.substringAfter("access_token=").substringBefore("&")
+                                    val decoded = URLDecoder.decode(tokenPart, "UTF-8")
+                                    if (decoded.isNotBlank()) {
+                                        android.webkit.CookieManager.getInstance().removeAllCookies(null)
+                                        view?.clearCache(true)
+                                        onTokenCaptured(decoded)
+                                    }
+                                }
+                            }
+
+                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                                val u = request?.url?.toString() ?: ""
+                                if (u.contains("access_token=")) {
+                                    val tokenPart = u.substringAfter("access_token=").substringBefore("&")
+                                    val decoded = URLDecoder.decode(tokenPart, "UTF-8")
+                                    if (decoded.isNotBlank()) {
+                                        android.webkit.CookieManager.getInstance().removeAllCookies(null)
+                                        view?.clearCache(true)
+                                        onTokenCaptured(decoded)
+                                        return true
+                                    }
+                                }
+                                return false
+                            }
+                        }
+                        loadUrl(XboxLiveAuthManager.MS_OAUTH_AUTHORIZE_URL)
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+// =========================================================================
 // TAB 5: XBOX LIVE LOGIN, OWNED LIBRARY SPENDING & PLAYTIME ANALYTICS HUB
 // =========================================================================
 @Composable
@@ -844,13 +980,12 @@ fun XboxProfileAndStatsScreen(
     ownedEntries: List<OwnedVaultEntry>,
     allKnownGames: List<XboxGameDeal>,
     storage: PriceHistoryStorage,
-    onConnectXbox: (String, String) -> Unit,
+    isSyncing: Boolean,
+    onLaunchMicrosoftOAuth: () -> Unit,
     onDisconnectXbox: () -> Unit,
     onAdjustHours: (String, Double) -> Unit
 ) {
     val context = LocalContext.current
-    var gamertagInput by remember { mutableStateOf(profile.gamertag) }
-    var apiKeyInput by remember { mutableStateOf(profile.apiKey) }
 
     val totalGamesOwned = ownedEntries.size
     val totalSpentInr = ownedEntries.sumOf { it.paidInr }
@@ -869,7 +1004,6 @@ fun XboxProfileAndStatsScreen(
             .padding(bottom = 28.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Xbox Live Account Login / Sync Card
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF131823)),
             shape = RoundedCornerShape(16.dp),
@@ -881,17 +1015,17 @@ fun XboxProfileAndStatsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = if (profile.isConnected) "🎮 ${profile.gamertag}" else "🎮 Xbox Live Account Sync",
+                            text = if (profile.isConnected) "🎮 ${profile.gamertag}" else "🎮 Official Xbox Live Account Login",
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Black,
                             color = Color(0xFF10B981)
                         )
                         Text(
-                            text = if (profile.isConnected) "XUID: ${profile.xuid} • ${profile.accountTier} • 🏆 ${profile.gamerscore} G"
-                            else "Sign in with Xbox Gamertag / OpenXBL Key to sync owned games & playtime hours",
-                            fontSize = 11.sp,
+                            text = if (profile.isConnected) "XUID: ${profile.xuid} • 🏆 ${profile.gamerscore} G"
+                            else "Sign in with your Microsoft Xbox credentials to automatically pull your real Xbox library, playtime hours, and INR store valuation.",
+                            fontSize = 12.sp,
                             color = Color.LightGray
                         )
                     }
@@ -902,55 +1036,40 @@ fun XboxProfileAndStatsScreen(
                     }
                 }
 
-                if (!profile.isConnected) {
-                    OutlinedTextField(
-                        value = gamertagInput,
-                        onValueChange = { gamertagInput = it },
-                        placeholder = { Text("Enter Xbox Gamertag (e.g., YasirXboxIN)...") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        shape = RoundedCornerShape(10.dp)
+                if (isSyncing) {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(CircleShape),
+                        color = Color(0xFF10B981)
                     )
-                    OutlinedTextField(
-                        value = apiKeyInput,
-                        onValueChange = { apiKeyInput = it },
-                        placeholder = { Text("Optional: OpenXBL API Key (xbl.io) for live XUID telemetry") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        shape = RoundedCornerShape(10.dp)
+                    Text("Authenticating with Xbox Live TitleHub & fetching INR store prices...", fontSize = 11.sp, color = Color(0xFF10B981))
+                }
+
+                Button(
+                    onClick = onLaunchMicrosoftOAuth,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(Icons.Default.AccountCircle, contentDescription = null, tint = Color.Black)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (profile.isConnected) "Re-Sync Xbox Account Library & Playtime" else "Sign in with Microsoft Xbox Account",
+                        color = Color.Black,
+                        fontWeight = FontWeight.Black,
+                        fontSize = 13.sp
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = { onConnectXbox(gamertagInput, apiKeyInput) },
-                            modifier = Modifier.weight(1f),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Text("Sync Xbox Gamertag & Stats", color = Color.Black, fontWeight = FontWeight.Black, fontSize = 12.sp)
-                        }
-                        OutlinedButton(
-                            onClick = {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.xbox.com/en-IN/live")))
-                            },
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Text("MS Login", color = Color(0xFFF59E0B), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
                 }
             }
         }
 
-        // Row 1: Financial Spending vs. MRP Value Statistics
         Text("💰 Financial & Collection Valuation (INR)", fontSize = 14.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             PriceStatBox("GAMES OWNED", "$totalGamesOwned", Color.White, Modifier.weight(1f))
-            PriceStatBox("TOTAL SPENT", "₹$totalSpentInr", Color(0xFFF59E0B), Modifier.weight(1f))
+            PriceStatBox("STORE VALUE", "₹$totalSpentInr", Color(0xFFF59E0B), Modifier.weight(1f))
             PriceStatBox("MRP VALUE", "₹$totalMrpInr", Color.LightGray, Modifier.weight(1f))
             PriceStatBox("SAVED ₹", "₹$totalSavedInr", Color(0xFF10B981), Modifier.weight(1f))
         }
 
-        // Row 2: Playtime Hours, ROI Cost-Per-Hour & Backlog Statistics
         Text("⏱️ Playtime Hours & Gaming ROI Analytics", fontSize = 14.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             val formattedHrs = String.format(Locale.US, "%.1f hrs", totalHoursPlayed)
@@ -960,12 +1079,11 @@ fun XboxProfileAndStatsScreen(
             PriceStatBox("BACKLOG", "$backlogCount Left", Color.LightGray, Modifier.weight(1f))
         }
 
-        // Owned Games Playtime & MRP Breakdown List
         Text("📚 Owned Games Library, Playtime & MRP Breakdown", fontSize = 14.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
         if (ownedEntries.isEmpty()) {
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF131823)), shape = RoundedCornerShape(12.dp)) {
                 Text(
-                    "Connect your Xbox Gamertag above or tap 'Mark as Owned' inside any game sheet to populate your spending, MRP valuation, and playtime hours.",
+                    "Tap 'Sign in with Microsoft Xbox Account' above to import your real Xbox game library and playtime, or tap 'Mark as Owned' inside any game sheet.",
                     modifier = Modifier.padding(14.dp),
                     fontSize = 12.sp,
                     color = Color.Gray
@@ -983,7 +1101,7 @@ fun XboxProfileAndStatsScreen(
                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text(entry.title, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color.White, modifier = Modifier.weight(1f), maxLines = 1)
-                            Text("Paid ₹${entry.paidInr} (MRP ₹${entry.mrpInr})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981))
+                            Text("₹${entry.paidInr} (MRP ₹${entry.mrpInr})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981))
                         }
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -1003,13 +1121,6 @@ fun XboxProfileAndStatsScreen(
                                 ) {
                                     Text("+2h", fontSize = 10.sp, color = Color(0xFF10B981))
                                 }
-                                OutlinedButton(
-                                    onClick = { onAdjustHours(entry.productId, 5.0) },
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                                    modifier = Modifier.height(26.dp)
-                                ) {
-                                    Text("+5h", fontSize = 10.sp, color = Color(0xFFF59E0B))
-                                }
                             }
                         }
                         LinearProgressIndicator(
@@ -1023,7 +1134,6 @@ fun XboxProfileAndStatsScreen(
             }
         }
 
-        // Export CSV / JSON Buttons
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(
                 onClick = {
@@ -1075,11 +1185,10 @@ fun TwoGameCompareDialog(gameA: XboxGameDeal, gameB: XboxGameDeal, onDismiss: ()
                     Text(gameB.title, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.White, modifier = Modifier.weight(1f), maxLines = 2)
                 }
                 HorizontalDivider(color = Color(0xFF263042))
-                CompareMetricRow("Live Price", "₹${gameA.currentPriceInr}", "₹${gameB.currentPriceInr}")
-                CompareMetricRow("All-Time Low", "₹${gameA.lowestEverInr}", "₹${gameB.lowestEverInr}")
+                CompareMetricRow("Live Price", formatStorePriceLabel(gameA.currentPriceInr), formatStorePriceLabel(gameB.currentPriceInr))
+                CompareMetricRow("MSRP", "₹${gameA.mrpInr}", "₹${gameB.mrpInr}")
                 CompareMetricRow("Discount", "-${gameA.discountPercent}%", "-${gameB.discountPercent}%")
                 CompareMetricRow("User Score", "${gameA.starRating}★", "${gameB.starRating}★")
-                CompareMetricRow("Critic Score", "${gameA.criticScore}/100", "${gameB.criticScore}/100")
                 CompareMetricRow("Game Pass", if (gameA.isGamePass) "Included" else "No", if (gameB.isGamePass) "Included" else "No")
             }
         },
@@ -1264,18 +1373,25 @@ fun GameGridCard(
                         )
                     }
                 }
-                Box(
-                    modifier = Modifier.align(Alignment.BottomStart).padding(8.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xDD131823)).padding(horizontal = 6.dp, vertical = 2.dp)
-                ) {
-                    Text("${game.recommendationEmoji} ${game.starRating}★", fontSize = 10.sp, color = Color(0xFFF59E0B), fontWeight = FontWeight.Bold)
+                if (game.starRating > 0.0) {
+                    Box(
+                        modifier = Modifier.align(Alignment.BottomStart).padding(8.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xDD131823)).padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text("${game.recommendationEmoji} ${game.starRating}★", fontSize = 10.sp, color = Color(0xFFF59E0B), fontWeight = FontWeight.Bold)
+                    }
                 }
             }
             Column(modifier = Modifier.padding(10.dp)) {
                 Text(game.title, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
-                    val priceLabel = if (game.currentPriceInr == 0) "FREE" else "₹${game.currentPriceInr}"
-                    Text(priceLabel, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF10B981))
+                    val priceLabel = formatStorePriceLabel(game.currentPriceInr)
+                    Text(
+                        text = priceLabel,
+                        fontSize = if (game.currentPriceInr < 0) 13.sp else 16.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = if (game.currentPriceInr < 0) Color(0xFFF59E0B) else Color(0xFF10B981)
+                    )
                     if (game.discountPercent > 0) {
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("₹${game.mrpInr}", fontSize = 11.sp, color = Color.Gray, textDecoration = TextDecoration.LineThrough)
@@ -1309,7 +1425,8 @@ fun GameCompactListCard(
             Spacer(modifier = Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(game.title, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("${game.genre} • ${game.starRating}★" + if (game.saleCountdownText.isNotBlank()) " • ${game.saleCountdownText}" else "", fontSize = 11.sp, color = Color.Gray)
+                val ratingStr = if (game.starRating > 0.0) " • ${game.starRating}★" else ""
+                Text("${game.genre}$ratingStr" + if (game.saleCountdownText.isNotBlank()) " • ${game.saleCountdownText}" else "", fontSize = 11.sp, color = Color.Gray)
                 Spacer(modifier = Modifier.height(4.dp))
                 Text("${game.recommendationEmoji} ${game.dealRating}", fontSize = 11.sp, color = Color(0xFFF59E0B), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
@@ -1327,8 +1444,12 @@ fun GameCompactListCard(
                         )
                     }
                 }
-                val priceLabel = if (game.currentPriceInr == 0) "FREE" else "₹${game.currentPriceInr}"
-                Text(priceLabel, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF10B981))
+                Text(
+                    text = formatStorePriceLabel(game.currentPriceInr),
+                    fontSize = if (game.currentPriceInr < 0) 12.sp else 16.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = if (game.currentPriceInr < 0) Color(0xFFF59E0B) else Color(0xFF10B981)
+                )
             }
         }
     }
@@ -1359,7 +1480,8 @@ fun GameDetailedCard(
                 Row(modifier = Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         if (game.discountPercent > 0) BadgePill("-${game.discountPercent}% OFF", Color(0xFF10B981), Color.Black)
-                        if (game.isLeavingGamePassSoon) BadgePill("⚠️ LEAVING SOON", Color(0xFFEF4444), Color.White)
+                        if (game.isUnreleasedOrNoPrice) BadgePill("📅 COMING SOON", Color(0xFFF59E0B), Color.Black)
+                        else if (game.isLeavingGamePassSoon) BadgePill("⚠️ LEAVING SOON", Color(0xFFEF4444), Color.White)
                         else if (game.isNewLaunch) BadgePill("🆕 NEW", Color(0xFFF59E0B), Color.Black)
                         if (game.isGamePass) BadgePill("GAME PASS", Color(0xFF107C10), Color.White)
                     }
@@ -1384,15 +1506,25 @@ fun GameDetailedCard(
                 }
                 Column(modifier = Modifier.align(Alignment.BottomStart).padding(14.dp)) {
                     Text(game.title, fontWeight = FontWeight.ExtraBold, fontSize = 18.sp, color = Color.White)
-                    Text("${game.publisher} • ${game.starRating}★ (${game.ratingCount}) • Critic ${game.criticScore}/100", fontSize = 12.sp, color = Color.LightGray)
+                    val scoreMeta = if (game.starRating > 0.0) " • ${game.starRating}★ (${game.ratingCount})" else ""
+                    Text("${game.publisher} • ${game.genre}$scoreMeta", fontSize = 12.sp, color = Color.LightGray)
                 }
             }
 
             Column(modifier = Modifier.padding(14.dp)) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Row(verticalAlignment = Alignment.Bottom) {
-                        val priceLabel = if (game.currentPriceInr == 0) "FREE TO PLAY" else "₹${game.currentPriceInr}"
-                        Text(priceLabel, fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color(0xFF10B981))
+                        val priceLabel = when {
+                            game.currentPriceInr < 0 -> "COMING SOON (No INR Price Yet)"
+                            game.currentPriceInr == 0 -> "FREE TO PLAY"
+                            else -> "₹${game.currentPriceInr}"
+                        }
+                        Text(
+                            text = priceLabel,
+                            fontSize = if (game.currentPriceInr < 0) 15.sp else 22.sp,
+                            fontWeight = FontWeight.Black,
+                            color = if (game.currentPriceInr < 0) Color(0xFFF59E0B) else Color(0xFF10B981)
+                        )
                         if (game.discountPercent > 0) {
                             Spacer(modifier = Modifier.width(8.dp))
                             Text("₹${game.mrpInr}", fontSize = 14.sp, color = Color.Gray, textDecoration = TextDecoration.LineThrough)
@@ -1401,8 +1533,8 @@ fun GameDetailedCard(
                     Column(horizontalAlignment = Alignment.End) {
                         if (game.saleCountdownText.isNotBlank()) {
                             Text(game.saleCountdownText, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFF59E0B))
-                        } else {
-                            Text("All-Time Low: ₹${game.lowestEverInr}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981))
+                        } else if (game.lowestEverInr > 0) {
+                            Text("Recorded Low: ₹${game.lowestEverInr}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981))
                         }
                         Text(game.saleCadenceNote, fontSize = 10.sp, color = Color.Gray)
                     }
@@ -1447,9 +1579,6 @@ fun BadgePill(text: String, bgColor: Color, textColor: Color) {
     }
 }
 
-// =========================================================================
-// DETAIL SHEET (ALWAYS DISPLAYS 1M / 1Y / ALL-TIME PRICE HISTORY CHARTS)
-// =========================================================================
 @Composable
 fun GameDetailAnalysisSheet(
     game: XboxGameDeal,
@@ -1461,11 +1590,11 @@ fun GameDetailAnalysisSheet(
     val context = LocalContext.current
     var playTrailer by remember { mutableStateOf(false) }
     var selectedTimeframe by remember { mutableStateOf("1Y") }
-    var targetPrice by remember { mutableIntStateOf(game.alertTargetInr ?: game.lowestEverInr.coerceAtLeast(100)) }
+    var targetPrice by remember { mutableIntStateOf(game.alertTargetInr ?: game.lowestEverInr.coerceAtLeast(500)) }
     var lightboxIndex by remember { mutableStateOf<Int?>(null) }
 
     var selectedCashbackPct by remember { mutableIntStateOf(0) }
-    val effectiveInr = ((game.currentPriceInr * (100 - selectedCashbackPct)) / 100.0).roundToInt()
+    val effectiveInr = if (game.currentPriceInr > 0) ((game.currentPriceInr * (100 - selectedCashbackPct)) / 100.0).roundToInt() else 0
 
     val activePoints = when (selectedTimeframe) {
         "1M" -> game.monthHistory
@@ -1473,9 +1602,9 @@ fun GameDetailAnalysisSheet(
         else -> game.yearHistory
     }
 
-    val tfLow = activePoints.minOfOrNull { it.priceInr } ?: game.lowestEverInr
-    val tfHigh = activePoints.maxOfOrNull { it.priceInr } ?: game.mrpInr
-    val tfAvg = if (activePoints.isNotEmpty()) activePoints.map { it.priceInr }.average().roundToInt() else game.currentPriceInr
+    val tfLow = activePoints.filter { it.priceInr > 0 }.minOfOrNull { it.priceInr } ?: game.lowestEverInr
+    val tfHigh = activePoints.filter { it.priceInr > 0 }.maxOfOrNull { it.priceInr } ?: game.mrpInr
+    val tfAvg = if (activePoints.isNotEmpty()) activePoints.map { it.priceInr.coerceAtLeast(0) }.average().roundToInt() else game.currentPriceInr.coerceAtLeast(0)
 
     if (lightboxIndex != null && game.screenshotUrls.isNotEmpty()) {
         val currentIdx = lightboxIndex!!.coerceIn(0, game.screenshotUrls.lastIndex)
@@ -1531,9 +1660,8 @@ fun GameDetailAnalysisSheet(
             }
             IconButton(onClick = {
                 val shareMsg = buildString {
-                    appendLine("🎮 *${game.title}* on Xbox India Store!")
-                    appendLine("💰 Live Price: *₹${game.currentPriceInr}* (MRP ₹${game.mrpInr}, -${game.discountPercent}%)")
-                    appendLine("📉 All-Time Low: ₹${game.lowestEverInr}")
+                    appendLine("🎮 *${game.title}* on Microsoft Store India!")
+                    appendLine("💰 Live Price: *${formatStorePriceLabel(game.currentPriceInr)}* (MRP ₹${game.mrpInr})")
                     appendLine("${game.recommendationEmoji} ${game.dealRating}")
                     append("🔗 ${game.storeUrl}")
                 }
@@ -1541,7 +1669,7 @@ fun GameDetailAnalysisSheet(
                     type = "text/plain"
                     putExtra(Intent.EXTRA_TEXT, shareMsg)
                 }
-                context.startActivity(Intent.createChooser(sendIntent, "Share Deal via WhatsApp / Telegram"))
+                context.startActivity(Intent.createChooser(sendIntent, "Share via WhatsApp / Telegram"))
             }) {
                 Icon(Icons.Default.Share, contentDescription = "Share Deal", tint = Color(0xFF10B981))
             }
@@ -1557,18 +1685,20 @@ fun GameDetailAnalysisSheet(
         Spacer(modifier = Modifier.height(10.dp))
 
         Box(modifier = Modifier.fillMaxWidth().height(190.dp).clip(RoundedCornerShape(14.dp)).background(Color.Black)) {
-            if (playTrailer) {
+            if (playTrailer && game.trailerUrl.isNotBlank()) {
                 InAppTrailerPlayer(videoUrl = game.trailerUrl)
             } else {
                 AsyncImage(model = game.coverImageUrl, contentDescription = game.title, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
-                Box(modifier = Modifier.fillMaxSize().background(Color(0x66000000)).clickable { playTrailer = true }, contentAlignment = Alignment.Center) {
-                    Row(
-                        modifier = Modifier.clip(CircleShape).background(Color(0xFF10B981)).padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = "Play Trailer", tint = Color.Black)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Watch Game Trailer", color = Color.Black, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
+                if (game.trailerUrl.isNotBlank()) {
+                    Box(modifier = Modifier.fillMaxSize().background(Color(0x66000000)).clickable { playTrailer = true }, contentAlignment = Alignment.Center) {
+                        Row(
+                            modifier = Modifier.clip(CircleShape).background(Color(0xFF10B981)).padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = "Play Trailer", tint = Color.Black)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Watch Official Store Trailer", color = Color.Black, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
+                        }
                     }
                 }
             }
@@ -1590,10 +1720,9 @@ fun GameDetailAnalysisSheet(
             }
         }
 
-        // Price History Section (Always rendered so user never misses 1M / 1Y / All-Time trends)
         Spacer(modifier = Modifier.height(16.dp))
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text("📈 Price History (INR)", fontWeight = FontWeight.ExtraBold, fontSize = 15.sp, color = Color.White)
+            Text("📈 Recorded Microsoft API Price History", fontWeight = FontWeight.ExtraBold, fontSize = 14.sp, color = Color.White)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf("1M" to "Month", "1Y" to "Year", "ALL" to "All-Time").forEach { (code, label) ->
                     FilterChip(selected = selectedTimeframe == code, onClick = { selectedTimeframe = code }, label = { Text(label, fontSize = 11.sp) })
@@ -1601,15 +1730,25 @@ fun GameDetailAnalysisSheet(
             }
         }
         Spacer(modifier = Modifier.height(8.dp))
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PriceStatBox("LOWEST", "₹$tfLow", Color(0xFF10B981), Modifier.weight(1f))
-            PriceStatBox("AVERAGE", "₹$tfAvg", Color(0xFFF59E0B), Modifier.weight(1f))
-            PriceStatBox("MRP HIGH", "₹$tfHigh", Color.LightGray, Modifier.weight(1f))
+        if (game.isUnreleasedOrNoPrice) {
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    "📅 Unreleased / Pre-Order Not Priced Yet: Microsoft Store India has not published an INR Purchase SKU for ${game.title} yet.",
+                    modifier = Modifier.padding(14.dp),
+                    fontSize = 12.sp,
+                    color = Color(0xFFF59E0B)
+                )
+            }
+        } else {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PriceStatBox("RECORDED LOW", "₹$tfLow", Color(0xFF10B981), Modifier.weight(1f))
+                PriceStatBox("AVERAGE", "₹$tfAvg", Color(0xFFF59E0B), Modifier.weight(1f))
+                PriceStatBox("MSRP HIGH", "₹$tfHigh", Color.LightGray, Modifier.weight(1f))
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            InteractivePriceHistoryChart(points = activePoints, lowestPrice = tfLow, maxPrice = tfHigh)
         }
-        Spacer(modifier = Modifier.height(10.dp))
-        InteractivePriceHistoryChart(points = activePoints, lowestPrice = tfLow, maxPrice = tfHigh)
 
-        // India Gift Card & Bank Cashback Calculator
         if (game.currentPriceInr > 0) {
             Spacer(modifier = Modifier.height(14.dp))
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
@@ -1636,12 +1775,12 @@ fun GameDetailAnalysisSheet(
             Spacer(modifier = Modifier.height(12.dp))
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("📦 Available Store Editions & Bundles", fontWeight = FontWeight.ExtraBold, fontSize = 13.sp, color = Color.White)
+                    Text("📦 Official Microsoft Store IN Editions & SKUs", fontWeight = FontWeight.ExtraBold, fontSize = 13.sp, color = Color.White)
                     game.editions.forEach { ed ->
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text(ed.skuTitle, fontSize = 12.sp, color = Color.LightGray, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text(
-                                text = if (ed.priceInr == 0) "FREE" else if (ed.discountPercent > 0) "₹${ed.priceInr} (-${ed.discountPercent}%)" else "₹${ed.priceInr}",
+                                text = if (ed.discountPercent > 0) "₹${ed.priceInr} (-${ed.discountPercent}%)" else "₹${ed.priceInr}",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color(0xFF10B981)
@@ -1654,23 +1793,6 @@ fun GameDetailAnalysisSheet(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("📊 Ratings, Platforms & Game Intel", fontWeight = FontWeight.ExtraBold, fontSize = 14.sp, color = Color.White)
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PriceStatBox("XBOX USER SCORE", "${game.starRating}★ (${game.ratingCount})", Color(0xFFF59E0B), Modifier.weight(1f))
-                    PriceStatBox("CRITIC SCORE", "${game.criticScore} / 100", Color(0xFF10B981), Modifier.weight(1f))
-                }
-                Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    game.supportedPlatforms.forEach { plat -> BadgePill(plat, Color(0xFF283347), Color.White) }
-                }
-                Text(game.communityReviewSummary, fontSize = 12.sp, color = Color.LightGray)
-                Text(game.latestNewsHeadline, fontSize = 12.sp, color = Color(0xFF10B981), fontWeight = FontWeight.Medium)
-            }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
         Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0E131D)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(14.dp)) {
                 Text("🔔 Target Price Drop Alert", fontWeight = FontWeight.Bold, fontSize = 14.sp)
@@ -1678,7 +1800,7 @@ fun GameDetailAnalysisSheet(
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     OutlinedIconButton(onClick = { targetPrice = (targetPrice - 100).coerceAtLeast(100) }) { Icon(Icons.Default.Remove, contentDescription = "Decrease") }
                     Text("₹$targetPrice", fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color(0xFFF59E0B))
-                    OutlinedIconButton(onClick = { targetPrice = (targetPrice + 100).coerceAtMost(maxOf(game.mrpInr, 500)) }) { Icon(Icons.Default.Add, contentDescription = "Increase") }
+                    OutlinedIconButton(onClick = { targetPrice = (targetPrice + 100).coerceAtMost(maxOf(game.mrpInr, 5000)) }) { Icon(Icons.Default.Add, contentDescription = "Increase") }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1726,7 +1848,11 @@ fun GameDetailAnalysisSheet(
         ) {
             Icon(Icons.Default.ShoppingCart, contentDescription = null, tint = Color.Black)
             Spacer(modifier = Modifier.width(8.dp))
-            val btnLabel = if (game.currentPriceInr == 0) "Get Free on Xbox Store India" else "Buy on Xbox Store India (₹${game.currentPriceInr})"
+            val btnLabel = when {
+                game.currentPriceInr < 0 -> "View Coming Soon Page on Xbox Store IN"
+                game.currentPriceInr == 0 -> "Get Free on Xbox Store India"
+                else -> "Buy on Xbox Store India (₹${game.currentPriceInr})"
+            }
             Text(btnLabel, color = Color.Black, fontWeight = FontWeight.Black)
         }
         Spacer(modifier = Modifier.height(28.dp))
@@ -1771,7 +1897,7 @@ fun InteractivePriceHistoryChart(points: List<PricePoint>, lowestPrice: Int, max
         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFF0E131D)).padding(12.dp)
     ) {
         if (activePt != null) {
-            Text("Selected: ${activePt.label} → ₹${activePt.priceInr}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981))
+            Text("Recorded Snapshot: ${activePt.label} → ₹${activePt.priceInr}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981))
             Spacer(modifier = Modifier.height(8.dp))
         }
         Canvas(

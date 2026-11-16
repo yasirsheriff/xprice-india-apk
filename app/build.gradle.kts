@@ -12,8 +12,8 @@ android {
         applicationId = "in.xprice.tracker"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "5.0.0"
+        versionCode = 13
+        versionName = "6.0.0"
     }
 
     buildFeatures {
@@ -27,7 +27,19 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
 }
+
+
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.10.00")
@@ -44,4 +56,7 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.4.1")
     implementation("androidx.glance:glance-appwidget:1.1.1")
     implementation("androidx.glance:glance-material3:1.1.1")
+
+    // High-speed HTTP/2 Connection Pool for sub-second parallel Microsoft API loading
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
