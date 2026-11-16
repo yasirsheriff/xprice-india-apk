@@ -167,7 +167,7 @@ class XboxNewsRepository(context: Context) {
                         insideItem = false
                         if (title.isNotBlank()) {
                             if (imageUrl.isBlank()) {
-        private val IMG_SRC_REGEX = Regex("<img[^>]+src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
+                                val imgMatch = IMG_SRC_REGEX.find(encodedContent) ?: IMG_SRC_REGEX.find(description)
                                 imageUrl = imgMatch?.groupValues?.getOrNull(1) ?: ""
                             }
                             val cleanTitle = stripHtml(title)
