@@ -32,7 +32,7 @@ class PriceAlertWorker(
 
                 liveDeals.forEach { deal ->
                     val alert = activeAlerts[deal.productId]
-                    if (alert != null && deal.currentPriceInr <= alert.targetPriceInr) {
+                    if (alert != null && deal.currentPriceInr in 1..alert.targetPriceInr) {
                         sendPriceDropNotification(
                             applicationContext,
                             deal.productId,

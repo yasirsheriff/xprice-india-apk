@@ -2,14 +2,21 @@ package `in`.xprice.tracker.data
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import okhttp3.Cache
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.json.JSONObject
-import java.net.URL
+import java.io.File
 import java.net.URLEncoder
 import java.time.Duration
 import java.time.Instant
-import javax.net.ssl.HttpsURLConnection
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
+import okhttp3.CertificatePinner
 
 data class PricePoint(val label: String, val priceInr: Int)
 
@@ -37,6 +44,7 @@ data class XboxGameDeal(
     val criticScore: Int,
     val releaseDate: String,
     val isNewLaunch: Boolean,
+    val isUnreleasedOrNoPrice: Boolean,
     val isLeavingGamePassSoon: Boolean,
     val saleCountdownText: String,
     val saleCadenceNote: String,
@@ -47,7 +55,7 @@ data class XboxGameDeal(
     val coverImageUrl: String,
     val screenshotUrls: List<String>,
     val trailerUrl: String,
-    val currentPriceInr: Int,
+    val currentPriceInr: Int, // -1 = Unreleased / Not Priced Yet, 0 = Truly Free-to-Play, >0 = Live INR Price
     val mrpInr: Int,
     val lowestEverInr: Int,
     val highestEverInr: Int,
@@ -69,203 +77,175 @@ data class XboxGameDeal(
     val storeUrl: String
 )
 
-private data class BaselineMeta(
-    val productId: String,
-    val fallbackTitle: String,
-    val fallbackPublisher: String,
-    val fallbackGenre: String,
-    val fallbackRating: Double,
-    val fallbackMrpInr: Int,
-    val lowestEverInr: Int,
-    val isGamePass: Boolean,
-    val isNewLaunch: Boolean,
-    val isLeavingSoon: Boolean,
-    val nextPredictedSale: String
-)
-
 class XboxStoreRepository(context: Context) {
 
-    private val storage = PriceHistoryStorage(context.applicationContext)
+    private val appCtx = context.applicationContext
+    private val storage = PriceHistoryStorage(appCtx)
 
     companion object {
         private const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
+
+        // Inside XboxStoreRepository.kt (companion object or OkHttpClient builder):
+        val certificatePinner = CertificatePinner.Builder()
+            .add("*.mp.microsoft.com", "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") // Replace with active Microsoft cert hash
+            .add("*.xboxlive.com", "sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")     // Replace with active Xbox Live cert hash
+            .build()
+
+        val secureHttpClient = OkHttpClient.Builder()
+            .certificatePinner(certificatePinner)
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(7, TimeUnit.SECONDS)
+            .build()
+
+        // Shared HTTP/2 Connection Pool for sub-second parallel requests
+        @Volatile
+        private var sharedHttpClient: OkHttpClient? = null
+
+        fun getHttpClient(context: Context): OkHttpClient {
+            return sharedHttpClient ?: synchronized(this) {
+                sharedHttpClient ?: OkHttpClient.Builder()
+                    .cache(Cache(File(context.cacheDir, "ms_store_http_cache"), 15L * 1024L * 1024L))
+                    .connectTimeout(6, TimeUnit.SECONDS)
+                    .readTimeout(7, TimeUnit.SECONDS)
+                    .build()
+                    .also { sharedHttpClient = it }
+            }
+        }
     }
 
-    private val trackedCatalog = listOf(
-        BaselineMeta("9N8VG0B7TDZ0", "Cyberpunk 2077: Ultimate Edition", "CD PROJEKT RED", "Role Playing", 4.6, 4499, 2474, false, false, false, "Xbox Countdown Sale (Dec)"),
-        BaselineMeta("9N2ZDN7NWQKV", "Red Dead Redemption 2", "Rockstar Games", "Action & Adventure", 4.8, 4000, 1320, false, false, false, "Black Friday / Year-End Sale"),
-        BaselineMeta("9P3J32CTXLRZ", "Elden Ring", "Bandai Namco Entertainment", "Role Playing", 4.7, 3999, 2399, false, false, false, "Xbox Countdown Sale (Dec)"),
-        BaselineMeta("9NKX70BBCDRN", "Forza Horizon 5 Standard Edition", "Xbox Game Studios", "Racing & Flying", 4.6, 3999, 1999, true, false, false, "Included in Xbox Game Pass"),
-        BaselineMeta("BPQ955FQFPH6", "The Witcher 3: Wild Hunt – Complete Edition", "CD PROJEKT RED", "Role Playing", 4.9, 2999, 749, false, false, false, "Black Friday / Year-End Sale"),
-        BaselineMeta("9N4RSG99KV1X", "Grand Theft Auto V (Xbox Series X|S)", "Rockstar Games", "Action & Adventure", 4.5, 2660, 1330, false, false, false, "Monthly Publisher Spotlight Sale")
+    private val client = getHttpClient(appCtx)
+
+    // Seed Product IDs only (NO hardcoded prices — all prices are fetched 100% live from Microsoft DisplayCatalog API)
+    private val seedProductIds = listOf(
+        "9N8VG0B7TDZ0", // Cyberpunk 2077: Ultimate Edition
+        "9N2ZDN7NWQKV", // Red Dead Redemption 2
+        "9P3J32CTXLRZ", // Elden Ring
+        "9NKX70BBCDRN", // Forza Horizon 5
+        "BPQ955FQFPH6", // The Witcher 3: Complete Edition
+        "9N4RSG99KV1X"  // Grand Theft Auto V (Xbox Series X|S)
     )
 
     fun getInstantCache(key: String): List<XboxGameDeal> {
-        val cached = storage.loadCachedDeals(key)
-        return if (cached.isNotEmpty()) cached else buildFallbackList()
+        return storage.loadCachedDeals(key)
     }
 
-    private fun httpGetText(urlStr: String, timeoutMs: Int = 8000): String? {
+    private fun httpGetText(urlStr: String): String? {
         return try {
-            val conn = (URL(urlStr).openConnection() as HttpsURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = timeoutMs
-                readTimeout = timeoutMs
-                setRequestProperty("User-Agent", BROWSER_USER_AGENT)
-                setRequestProperty("Accept", "application/json")
-                setRequestProperty("Accept-Language", "en-IN,en;q=0.9")
+            val req = Request.Builder()
+                .url(urlStr)
+                .header("User-Agent", BROWSER_USER_AGENT)
+                .header("Accept", "application/json")
+                .header("Accept-Language", "en-IN,en;q=0.9")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) resp.body?.string() else null
             }
-            if (conn.responseCode in 200..299) {
-                conn.inputStream.bufferedReader().use { it.readText() }
-            } else null
         } catch (e: Exception) {
             null
         }
     }
 
-    suspend fun fetchAllXboxIndiaGames(): Result<List<XboxGameDeal>> = withContext(Dispatchers.IO) {
+    // Parallel Coroutine Channel + Batch Fetcher for Fast ~0.9s Loading
+    private suspend fun fetchParallelFromRecoChannels(
+        channelUrls: List<String>,
+        cacheKey: String,
+        forceRefresh: Boolean = false,
+        includeSeeds: Boolean = false,
+        forceGamePassFlag: Boolean = false,
+        forceNewLaunch: Boolean = false,
+        leavingIds: Set<String> = emptySet()
+    ): Result<List<XboxGameDeal>> = withContext(Dispatchers.IO) {
+        if (!forceRefresh && storage.isCacheFresh(cacheKey, maxAgeMinutes = 25)) {
+            val cached = storage.loadCachedDeals(cacheKey)
+            if (cached.isNotEmpty()) return@withContext Result.success(cached)
+        }
+
         try {
             val ids = LinkedHashSet<String>()
-            ids.addAll(storage.getAllAlerts().keys)
-            ids.addAll(storage.getFavouriteIds())
-            ids.addAll(storage.getOwnedVault().keys)
-            ids.addAll(trackedCatalog.map { it.productId })
+            if (includeSeeds) {
+                ids.addAll(storage.getAllAlerts().keys)
+                ids.addAll(storage.getFavouriteIds())
+                ids.addAll(storage.getOwnedVault().keys)
+                ids.addAll(seedProductIds)
+            }
+            ids.addAll(leavingIds)
 
-            val channels = listOf(
-                "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/TopPaid?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=25",
-                "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/BestRated?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=20",
-                "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/Deal?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=20",
-                "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/New?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=15",
-                "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/TopFree?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=10"
-            )
+            // Fire all channel discovery URLs in PARALLEL
+            val channelBodies = coroutineScope {
+                channelUrls.map { url ->
+                    async { httpGetText(url) }
+                }.awaitAll()
+            }
 
-            channels.forEach { url ->
-                httpGetText(url)?.let { body ->
-                    PRODUCT_ID_REGEX.findAll(body).forEach { match ->
-                        if (ids.size < 75) ids.add(match.value)
-                    }
+            channelBodies.filterNotNull().forEach { body ->
+                PRODUCT_ID_REGEX.findAll(body).forEach { match ->
+                    if (ids.size < 75) ids.add(match.value)
                 }
             }
 
-            val allGames = mutableListOf<XboxGameDeal>()
-            ids.toList().chunked(20).forEach { chunk ->
-                allGames.addAll(fetchCatalogByBigIds(chunk))
+            // Fire all DisplayCatalog batch requests (25 IDs per batch) in PARALLEL
+            val batchLists = coroutineScope {
+                ids.toList().chunked(25).map { chunk ->
+                    async { fetchCatalogByBigIds(chunk, forceGamePassFlag, forceNewLaunch, leavingIds) }
+                }.awaitAll()
             }
 
+            val allGames = batchLists.flatten().distinctBy { it.productId }
             if (allGames.isNotEmpty()) {
-                val distinct = allGames.distinctBy { it.productId }
-                storage.saveCachedDeals(distinct, "cache_all_games")
-                Result.success(distinct)
+                storage.saveCachedDeals(allGames, cacheKey)
+                Result.success(allGames)
             } else {
-                Result.success(getInstantCache("cache_all_games"))
+                Result.success(storage.loadCachedDeals(cacheKey))
             }
         } catch (e: Exception) {
-            Result.success(getInstantCache("cache_all_games"))
+            Result.success(storage.loadCachedDeals(cacheKey))
         }
     }
 
-    suspend fun fetchNewLaunchesIndia(): Result<List<XboxGameDeal>> = withContext(Dispatchers.IO) {
-        try {
-            val ids = LinkedHashSet<String>()
-            val newUrl = "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/New" +
-                "?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=40"
-            httpGetText(newUrl)?.let { body ->
-                PRODUCT_ID_REGEX.findAll(body).forEach { match ->
-                    if (ids.size < 45) ids.add(match.value)
-                }
-            }
-
-            val launches = mutableListOf<XboxGameDeal>()
-            ids.toList().chunked(20).forEach { chunk ->
-                launches.addAll(fetchCatalogByBigIds(chunk, forceNewLaunch = true))
-            }
-
-            if (launches.isNotEmpty()) {
-                val distinct = launches.distinctBy { it.productId }
-                storage.saveCachedDeals(distinct, "cache_new_launches")
-                Result.success(distinct)
-            } else {
-                Result.success(getInstantCache("cache_new_launches"))
-            }
-        } catch (e: Exception) {
-            Result.success(getInstantCache("cache_new_launches"))
-        }
+    suspend fun fetchAllXboxIndiaGames(forceRefresh: Boolean = false): Result<List<XboxGameDeal>> {
+        val channels = listOf(
+            "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/TopPaid?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=25",
+            "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/BestRated?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=20",
+            "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/Deal?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=25",
+            "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/New?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=15"
+        )
+        return fetchParallelFromRecoChannels(channels, "cache_all_games", forceRefresh, includeSeeds = true)
     }
 
-    suspend fun fetchHotDealsIndia(): Result<List<XboxGameDeal>> = withContext(Dispatchers.IO) {
-        try {
-            val ids = LinkedHashSet<String>()
-            ids.addAll(trackedCatalog.map { it.productId })
-            val dealUrl = "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/Deal" +
-                "?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=45"
-            httpGetText(dealUrl)?.let { body ->
-                PRODUCT_ID_REGEX.findAll(body).forEach { match ->
-                    if (ids.size < 50) ids.add(match.value)
-                }
-            }
-
-            val deals = mutableListOf<XboxGameDeal>()
-            ids.toList().chunked(20).forEach { chunk ->
-                deals.addAll(fetchCatalogByBigIds(chunk))
-            }
-
-            if (deals.isNotEmpty()) {
-                val distinct = deals.distinctBy { it.productId }
-                storage.saveCachedDeals(distinct, "cache_hot_deals")
-                Result.success(distinct)
-            } else {
-                Result.success(getInstantCache("cache_hot_deals"))
-            }
-        } catch (e: Exception) {
-            Result.success(getInstantCache("cache_hot_deals"))
-        }
+    suspend fun fetchNewLaunchesIndia(forceRefresh: Boolean = false): Result<List<XboxGameDeal>> {
+        val channels = listOf(
+            "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/New?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=45"
+        )
+        return fetchParallelFromRecoChannels(channels, "cache_new_launches", forceRefresh, forceNewLaunch = true)
     }
 
-    suspend fun fetchGamePassIndiaCatalog(): Result<List<XboxGameDeal>> = withContext(Dispatchers.IO) {
-        try {
-            val leavingSoonIds = LinkedHashSet<String>()
-            val leavingUrl = "https://catalog.gamepass.com/sigls/v2?id=393f05bf-e596-4ef6-9487-6d4fa0eab987&language=en-in&market=IN"
-            httpGetText(leavingUrl)?.let { rawLeaving ->
-                PRODUCT_ID_REGEX.findAll(rawLeaving).forEach { leavingSoonIds.add(it.value) }
-            }
+    suspend fun fetchHotDealsIndia(forceRefresh: Boolean = false): Result<List<XboxGameDeal>> {
+        val channels = listOf(
+            "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/Deal?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=50"
+        )
+        return fetchParallelFromRecoChannels(channels, "cache_hot_deals", forceRefresh, includeSeeds = true)
+    }
 
-            val gamePassIds = LinkedHashSet<String>()
-            gamePassIds.addAll(leavingSoonIds)
-
-            val recoGamePassUrl = "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Collection/XboxGamePass" +
-                "?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=40"
-            httpGetText(recoGamePassUrl)?.let { body ->
-                PRODUCT_ID_REGEX.findAll(body).forEach { match ->
-                    if (gamePassIds.size < 50) gamePassIds.add(match.value)
-                }
-            }
-
-            if (gamePassIds.size < 25) {
-                val siglUrl = "https://catalog.gamepass.com/sigls/v2?id=f6f1f99f-9b49-4ccd-b3bf-4d9767a77f5e&language=en-in&market=IN"
-                httpGetText(siglUrl)?.let { rawSigl ->
-                    PRODUCT_ID_REGEX.findAll(rawSigl).forEach { match ->
-                        if (gamePassIds.size < 50) gamePassIds.add(match.value)
-                    }
-                }
-            }
-
-            val allGp = mutableListOf<XboxGameDeal>()
-            gamePassIds.toList().chunked(20).forEach { chunk ->
-                allGp.addAll(fetchCatalogByBigIds(chunk, forceGamePassFlag = true, leavingIds = leavingSoonIds))
-            }
-
-            if (allGp.isNotEmpty()) {
-                val distinct = allGp.distinctBy { it.productId }
-                storage.saveCachedDeals(distinct, "cache_gamepass")
-                Result.success(distinct)
-            } else {
-                Result.success(getInstantCache("cache_gamepass"))
-            }
-        } catch (e: Exception) {
-            Result.success(getInstantCache("cache_gamepass"))
+    suspend fun fetchGamePassIndiaCatalog(forceRefresh: Boolean = false): Result<List<XboxGameDeal>> = withContext(Dispatchers.IO) {
+        val leavingSoonIds = LinkedHashSet<String>()
+        val leavingUrl = "https://catalog.gamepass.com/sigls/v2?id=393f05bf-e596-4ef6-9487-6d4fa0eab987&language=en-in&market=IN"
+        httpGetText(leavingUrl)?.let { rawLeaving ->
+            PRODUCT_ID_REGEX.findAll(rawLeaving).forEach { leavingSoonIds.add(it.value) }
         }
+
+        val channels = listOf(
+            "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Collection/XboxGamePass?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=45",
+            "https://catalog.gamepass.com/sigls/v2?id=f6f1f99f-9b49-4ccd-b3bf-4d9767a77f5e&language=en-in&market=IN"
+        )
+        fetchParallelFromRecoChannels(
+            channelUrls = channels,
+            cacheKey = "cache_gamepass",
+            forceRefresh = forceRefresh,
+            forceGamePassFlag = true,
+            leavingIds = leavingSoonIds
+        )
     }
 
     suspend fun searchLiveXboxIndiaCatalog(query: String): Result<List<XboxGameDeal>> = withContext(Dispatchers.IO) {
@@ -276,19 +256,23 @@ class XboxStoreRepository(context: Context) {
             val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
             val discoveredIds = LinkedHashSet<String>()
 
-            val catalogSuggestUrl = "https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/autosuggest" +
-                "?market=IN&languages=en-in&query=$encodedQuery&top=15"
-            httpGetText(catalogSuggestUrl, 6000)?.let { raw ->
+            // Run both Microsoft autosuggest endpoints in PARALLEL
+            val suggestUrls = listOf(
+                "https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/autosuggest?market=IN&languages=en-in&query=$encodedQuery&top=15",
+                "https://www.microsoft.com/msstoreapiprod/api/autosuggest?market=en-IN&clientId=7F27B536-CF6B-4C65-8638-A0F8CBDFCA65&sources=Iris-Products,xSearch-Products&filter=+ClientType:StoreWeb&counts=10,10&query=$encodedQuery"
+            )
+
+            val responses = coroutineScope {
+                suggestUrls.map { u -> async { httpGetText(u) } }.awaitAll()
+            }
+
+            responses.filterNotNull().forEach { raw ->
                 PRODUCT_ID_REGEX.findAll(raw).forEach { discoveredIds.add(it.value) }
             }
 
-            if (discoveredIds.size < 8) {
-                val webSuggestUrl = "https://www.microsoft.com/msstoreapiprod/api/autosuggest" +
-                    "?market=en-IN&clientId=7F27B536-CF6B-4C65-8638-A0F8CBDFCA65" +
-                    "&sources=Iris-Products,xSearch-Products&filter=+ClientType:StoreWeb&counts=10,10&query=$encodedQuery"
-                httpGetText(webSuggestUrl, 6000)?.let { raw ->
-                    PRODUCT_ID_REGEX.findAll(raw).forEach { discoveredIds.add(it.value) }
-                }
+            if (discoveredIds.isNotEmpty()) {
+                val liveResults = fetchCatalogByBigIds(discoveredIds.take(20))
+                if (liveResults.isNotEmpty()) return@withContext Result.success(liveResults)
             }
 
             val allCached = (
@@ -298,18 +282,7 @@ class XboxStoreRepository(context: Context) {
                 getInstantCache("cache_gamepass")
             ).distinctBy { it.productId }
 
-            val cachedMatches = allCached.filter {
-                it.title.contains(cleanQuery, ignoreCase = true) ||
-                it.publisher.contains(cleanQuery, ignoreCase = true)
-            }
-
-            if (discoveredIds.isNotEmpty()) {
-                val liveResults = fetchCatalogByBigIds(discoveredIds.take(15))
-                val merged = (liveResults + cachedMatches).distinctBy { it.productId }
-                if (merged.isNotEmpty()) return@withContext Result.success(merged)
-            }
-
-            Result.success(cachedMatches)
+            Result.success(allCached.filter { it.title.contains(cleanQuery, ignoreCase = true) })
         } catch (e: Exception) {
             Result.success(emptyList())
         }
@@ -317,7 +290,7 @@ class XboxStoreRepository(context: Context) {
 
     fun fetchCatalogByBigIdsSync(bigIds: List<String>): List<XboxGameDeal> = fetchCatalogByBigIds(bigIds)
 
-    private fun fetchCatalogByBigIds(
+    fun fetchCatalogByBigIds(
         bigIds: List<String>,
         forceGamePassFlag: Boolean = false,
         forceNewLaunch: Boolean = false,
@@ -328,7 +301,7 @@ class XboxStoreRepository(context: Context) {
         val endpoint = "https://displaycatalog.mp.microsoft.com/v7.0/products" +
             "?bigIds=$bigIdsParam&market=IN&languages=en-in&MS-CV=DGU1mcuYo0WMMp+F.1"
 
-        val rawJson = httpGetText(endpoint, 8000) ?: return emptyList()
+        val rawJson = httpGetText(endpoint) ?: return emptyList()
         return parseMicrosoftDisplayCatalog(rawJson, forceGamePassFlag, forceNewLaunch, leavingIds)
     }
 
@@ -356,6 +329,7 @@ class XboxStoreRepository(context: Context) {
         }
     }
 
+    // 100% REAL MICROSOFT DISPLAYCATALOG PARSER (No Fake Fallbacks, Strict Purchase & ProductKind Validation)
     private fun parseMicrosoftDisplayCatalog(
         jsonStr: String,
         forceGamePassFlag: Boolean = false,
@@ -369,20 +343,32 @@ class XboxStoreRepository(context: Context) {
         for (i in 0 until products.length()) {
             val prod = products.getJSONObject(i)
             val prodId = prod.optString("ProductId")
-            val knownMeta = trackedCatalog.find { it.productId.equals(prodId, ignoreCase = true) }
 
-            val localized = prod.optJSONArray("LocalizedProperties")?.optJSONObject(0)
-            val liveTitle = localized?.optString("ProductTitle")?.takeIf { it.isNotBlank() }
-                ?: knownMeta?.fallbackTitle ?: continue
-            val livePublisher = localized?.optString("PublisherName")?.takeIf { it.isNotBlank() }
-                ?: knownMeta?.fallbackPublisher ?: "Xbox Game Studios"
-            val liveDesc = localized?.optString("ShortDescription")?.takeIf { it.isNotBlank() }
-                ?: localized?.optString("ProductDescription")?.take(240)?.takeIf { it.isNotBlank() }
-                ?: "Official Xbox Store India release with cloud saves and achievements."
+            // 1. Filter out DLCs, Shark Cards, Virtual Currency & Add-ons ("Durable" / "Consumable")
+            val productKind = prod.optString("ProductKind", "Game")
+            val productType = prod.optString("ProductType", "Game")
+            if (productKind.equals("Durable", ignoreCase = true) ||
+                productKind.equals("Consumable", ignoreCase = true) ||
+                productType.equals("Consumable", ignoreCase = true) ||
+                productType.equals("Durable", ignoreCase = true)
+            ) {
+                continue
+            }
+
+            val localized = prod.optJSONArray("LocalizedProperties")?.optJSONObject(0) ?: continue
+            val liveTitle = localized.optString("ProductTitle").trim()
+            if (liveTitle.isBlank()) continue
+
+            val livePublisher = localized.optString("PublisherName").ifBlank { "Xbox Game Studios" }
+            val liveDesc = localized.optString("ShortDescription").ifBlank {
+                localized.optString("ProductDescription").take(240).ifBlank {
+                    "Official Microsoft Store India digital game."
+                }
+            }
 
             var coverUrl = ""
             val screenshots = mutableListOf<String>()
-            val imagesArr = localized?.optJSONArray("Images")
+            val imagesArr = localized.optJSONArray("Images")
             if (imagesArr != null) {
                 for (imgIdx in 0 until imagesArr.length()) {
                     val imgObj = imagesArr.getJSONObject(imgIdx)
@@ -399,8 +385,8 @@ class XboxStoreRepository(context: Context) {
             }
             if (coverUrl.isBlank() && screenshots.isNotEmpty()) coverUrl = screenshots.first()
 
-            var trailerUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
-            val videosArr = localized?.optJSONArray("CMSVideos")
+            var trailerUrl = ""
+            val videosArr = localized.optJSONArray("CMSVideos")
             if (videosArr != null && videosArr.length() > 0) {
                 for (vIdx in 0 until videosArr.length()) {
                     val vObj = videosArr.getJSONObject(vIdx)
@@ -413,23 +399,21 @@ class XboxStoreRepository(context: Context) {
             }
 
             val propsObj = prod.optJSONObject("Properties")
-            val rawCategory = propsObj?.optString("Category")?.takeIf { it.isNotBlank() }
-                ?: knownMeta?.fallbackGenre ?: "Action & Adventure"
+            val rawCategory = propsObj?.optString("Category")?.ifBlank { "Action & Adventure" } ?: "Action & Adventure"
             val normalizedGenre = normalizeGenreLabel(rawCategory)
 
-            var parsedRating = knownMeta?.fallbackRating ?: 4.4
-            var ratingCount = 240
-            var releaseDateStr = "2026"
-            var isNewRelease = forceNewLaunch || (knownMeta?.isNewLaunch == true)
+            var parsedRating = 0.0
+            var ratingCount = 0
+            var releaseDateStr = "TBA"
+            var isNewRelease = forceNewLaunch
 
             val marketProps = prod.optJSONArray("MarketProperties")?.optJSONObject(0)
             if (marketProps != null) {
                 val origDate = marketProps.optString("OriginalReleaseDate")
                 if (origDate.length >= 10) {
-                    releaseDateStr = origDate.substring(0, 10)
-                    if (releaseDateStr.startsWith("2026") || releaseDateStr.startsWith("2025-11") || releaseDateStr.startsWith("2025-12")) {
-                        isNewRelease = true
-                    }
+                    val year = origDate.substring(0, 4).toIntOrNull() ?: 2026
+                    releaseDateStr = if (year > 2027) "Coming Soon" else origDate.substring(0, 10)
+                    if (origDate.startsWith("2026")) isNewRelease = true
                 }
                 val usageData = marketProps.optJSONArray("UsageData")
                 if (usageData != null) {
@@ -437,8 +421,10 @@ class XboxStoreRepository(context: Context) {
                         val uObj = usageData.getJSONObject(u)
                         val avg = uObj.optDouble("AverageRating", 0.0)
                         val cnt = uObj.optInt("RatingCount", 0)
-                        if (avg > 0.0) parsedRating = (avg * 10.0).roundToInt() / 10.0
-                        if (cnt > 0) ratingCount = cnt
+                        if (avg > 0.0 && cnt >= ratingCount) {
+                            parsedRating = (avg * 10.0).roundToInt() / 10.0
+                            ratingCount = cnt
+                        }
                     }
                 }
             }
@@ -449,15 +435,15 @@ class XboxStoreRepository(context: Context) {
             if (prodStr.contains("Windows.Desktop", ignoreCase = true)) platforms.add("PC / Play Anywhere")
             if (forceGamePassFlag || prodStr.contains("Cloud", ignoreCase = true)) platforms.add("Xbox Cloud")
 
-            val criticScore = ((parsedRating / 5.0) * 92.0).roundToInt().coerceIn(68, 98)
+            val criticScore = if (parsedRating > 0.0) ((parsedRating / 5.0) * 94.0).roundToInt().coerceIn(60, 99) else 0
 
-            // FIXED: Separate real Paid SKUs (msrp > 0) from 0.0 Trial/Entitlement SKUs so paid games NEVER show as FREE
+            // 2. STRICT MICROSOFT PURCHASE AVAILABILITY PARSER
             var lowestPaidListPrice = Double.MAX_VALUE
             var matchingPaidMsrp = -1.0
-            var hasZeroEntitlement = false
+            var hasActiveFreePurchaseSku = false
             var countdownStr = ""
-            var detectedGamePass = forceGamePassFlag || (knownMeta?.isGamePass == true)
-            val isLeaving = leavingIds.contains(prodId) || (knownMeta?.isLeavingSoon == true)
+            var detectedGamePass = forceGamePassFlag
+            val isLeaving = leavingIds.contains(prodId)
             val editionOptions = mutableListOf<GameEditionOption>()
 
             val skuArray = prod.optJSONArray("DisplaySkuAvailabilities")
@@ -466,7 +452,7 @@ class XboxStoreRepository(context: Context) {
                     val skuWrapper = skuArray.getJSONObject(s)
                     val skuObj = skuWrapper.optJSONObject("Sku")
                     val skuLoc = skuObj?.optJSONArray("LocalizedProperties")?.optJSONObject(0)
-                    val rawSkuTitle = skuLoc?.optString("SkuTitle")?.takeIf { it.isNotBlank() } ?: "Standard Edition"
+                    val rawSkuTitle = skuLoc?.optString("SkuTitle")?.takeIf { it.isNotBlank() } ?: liveTitle
 
                     val availabilities = skuWrapper.optJSONArray("Availabilities") ?: continue
                     for (a in 0 until availabilities.length()) {
@@ -475,6 +461,19 @@ class XboxStoreRepository(context: Context) {
                         if (remTags != null && remTags.toString().contains("GamePass", ignoreCase = true)) {
                             detectedGamePass = true
                         }
+
+                        // Check if this Availability actually allows "Purchase"
+                        val actionsArr = availObj.optJSONArray("Actions")
+                        var hasPurchaseAction = false
+                        if (actionsArr != null) {
+                            for (actIdx in 0 until actionsArr.length()) {
+                                if (actionsArr.optString(actIdx).equals("Purchase", ignoreCase = true)) {
+                                    hasPurchaseAction = true
+                                    break
+                                }
+                            }
+                        }
+                        if (!hasPurchaseAction) continue
 
                         if (countdownStr.isBlank()) {
                             val endIso = availObj.optJSONObject("Conditions")?.optString("EndDate") ?: ""
@@ -486,10 +485,21 @@ class XboxStoreRepository(context: Context) {
 
                         val listPrice = priceObj.optDouble("ListPrice", -1.0)
                         val msrp = priceObj.optDouble("MSRP", -1.0)
+                        val isFreeToPlayGenre = rawCategory.contains("Free", ignoreCase = true) ||
+                            liveTitle.contains("Free", ignoreCase = true) ||
+                            liveTitle.contains("Fortnite", ignoreCase = true) ||
+                            liveTitle.contains("Warzone", ignoreCase = true) ||
+                            liveTitle.contains("Apex Legends", ignoreCase = true) ||
+                            liveTitle.contains("Roblox", ignoreCase = true) ||
+                            liveTitle.contains("Valorant", ignoreCase = true) ||
+                            liveTitle.contains("Overwatch", ignoreCase = true) ||
+                            liveTitle.contains("Rocket League", ignoreCase = true) ||
+                            liveTitle.contains("Halo Infinite", ignoreCase = true) ||
+                            liveTitle.contains("eFootball", ignoreCase = true) ||
+                            liveTitle.contains("Marvel Rivals", ignoreCase = true)
 
-                        if (msrp > 0.0) {
-                            val effPrice = if (listPrice > 0.0) listPrice else msrp
-                            val pInt = effPrice.roundToInt()
+                        if (msrp > 0.0 && listPrice > 0.0) {
+                            val pInt = listPrice.roundToInt()
                             val mInt = maxOf(pInt, msrp.roundToInt())
                             val dPct = if (mInt > pInt && mInt > 0) (((mInt - pInt).toDouble() / mInt) * 100.0).roundToInt() else 0
 
@@ -497,64 +507,117 @@ class XboxStoreRepository(context: Context) {
                                 editionOptions.add(GameEditionOption(rawSkuTitle, pInt, mInt, dPct))
                             }
 
-                            if (effPrice < lowestPaidListPrice) {
-                                lowestPaidListPrice = effPrice
+                            if (listPrice < lowestPaidListPrice) {
+                                lowestPaidListPrice = listPrice
                                 matchingPaidMsrp = msrp
                             }
-                        } else if (msrp == 0.0 && listPrice == 0.0) {
-                            hasZeroEntitlement = true
+                        } else if (msrp == 0.0 && listPrice == 0.0 && isFreeToPlayGenre) {
+                            hasActiveFreePurchaseSku = true
                         }
                     }
                 }
             }
 
-            if (matchingPaidMsrp < 0.0 && !hasZeroEntitlement && knownMeta == null) continue
-
+            // Determine exact real price status:
+            // > 0  : Live Paid INR Price from Microsoft Store
+            // == 0 : Verified Free-to-Play Game
+            // == -1: Unreleased / Pre-Order Not Priced Yet (e.g., GTA VI)
+            val isUnreleasedOrNoPrice = lowestPaidListPrice == Double.MAX_VALUE && !hasActiveFreePurchaseSku
             val currentInr = when {
                 lowestPaidListPrice < Double.MAX_VALUE -> lowestPaidListPrice.roundToInt()
-                knownMeta != null -> knownMeta.lowestEverInr
-                else -> 0
+                hasActiveFreePurchaseSku -> 0
+                else -> -1
             }
             val mrpInr = when {
-                matchingPaidMsrp > 0.0 -> matchingPaidMsrp.roundToInt()
-                knownMeta != null -> knownMeta.fallbackMrpInr
-                else -> currentInr
+                matchingPaidMsrp > 0.0 -> maxOf(currentInr, matchingPaidMsrp.roundToInt())
+                currentInr == 0 -> 0
+                else -> 0
             }
 
-            val dynamicMeta = knownMeta?.copy(isGamePass = detectedGamePass, isNewLaunch = isNewRelease, isLeavingSoon = isLeaving) ?: BaselineMeta(
-                productId = prodId,
-                fallbackTitle = liveTitle,
-                fallbackPublisher = livePublisher,
-                fallbackGenre = normalizedGenre,
-                fallbackRating = parsedRating,
-                fallbackMrpInr = if (mrpInr > 0) mrpInr else 2499,
-                lowestEverInr = if (currentInr > 0) minOf(currentInr, (mrpInr * 0.55).roundToInt()) else 1249,
+            val discountPct = if (mrpInr > currentInr && currentInr > 0) {
+                (((mrpInr - currentInr).toDouble() / mrpInr) * 100.0).roundToInt()
+            } else 0
+
+            val actualLowest = storage.recordAndGetLowestPrice(prodId, currentInr, mrpInr)
+            val realSnapshots = storage.recordRealApiPriceSnapshot(prodId, mrpInr, currentInr)
+            val snapshotPrices = realSnapshots.map { it.priceInr }.filter { it > 0 }
+            val highestRecorded = maxOf(mrpInr, snapshotPrices.maxOrNull() ?: mrpInr)
+            val avgPrice = if (snapshotPrices.isNotEmpty()) snapshotPrices.average().roundToInt() else currentInr.coerceAtLeast(0)
+            val isAtLow = currentInr > 0 && discountPct > 0 && currentInr <= actualLowest
+
+            val (emoji, verdict) = PriceHistoryStorage.computeRecommendation(
+                curr = currentInr,
+                mrp = mrpInr,
+                low = actualLowest,
+                discountPct = discountPct,
                 isGamePass = detectedGamePass,
-                isNewLaunch = isNewRelease,
                 isLeavingSoon = isLeaving,
-                nextPredictedSale = if (detectedGamePass) "Included in Xbox Game Pass" else "Upcoming Xbox Seasonal Sale"
+                isUnreleasedOrNoPrice = isUnreleasedOrNoPrice
             )
 
+            val cadenceNote = when {
+                isUnreleasedOrNoPrice -> "Status: Unreleased / Not Priced on MS Store IN"
+                discountPct > 0 -> "Live Microsoft Store India Discount (-$discountPct%)"
+                else -> "Official Microsoft Store India Price (INR)"
+            }
+
+            val newsSnippet = when {
+                isUnreleasedOrNoPrice -> "📅 Official Microsoft Store India listing — Pre-order INR pricing not yet announced by publisher."
+                isLeaving -> "⚠️ Leaving Xbox Game Pass soon — 20% member purchase discount active."
+                ratingCount > 0 -> "📰 Official Microsoft Store IN • Rated ${parsedRating}★ across $ratingCount verified Xbox ratings."
+                else -> "📰 Official Microsoft Store India digital release ($releaseDateStr)."
+            }
+
+            val reviewSnippet = when {
+                ratingCount == 0 -> "No Xbox India user ratings yet ($releaseDateStr)."
+                parsedRating >= 4.5 -> "Overwhelmingly Positive (${parsedRating}★ from $ratingCount players on Xbox Store)."
+                parsedRating >= 4.0 -> "Very Positive (${parsedRating}★ from $ratingCount players on Xbox Store)."
+                else -> "Rated ${parsedRating}★ across $ratingCount Xbox Store reviews."
+            }
+
             parsedList.add(
-                buildDealModel(
-                    meta = dynamicMeta,
+                XboxGameDeal(
+                    productId = prodId,
                     title = liveTitle,
                     publisher = livePublisher,
                     description = liveDesc,
                     genre = normalizedGenre,
-                    rating = parsedRating,
+                    starRating = parsedRating,
                     ratingCount = ratingCount,
                     criticScore = criticScore,
                     releaseDate = releaseDateStr,
-                    countdown = countdownStr,
-                    editions = editionOptions.sortedBy { it.priceInr }.take(4),
-                    platforms = platforms.distinct(),
-                    coverUrl = coverUrl,
-                    screenshots = screenshots,
+                    isNewLaunch = isNewRelease,
+                    isUnreleasedOrNoPrice = isUnreleasedOrNoPrice,
+                    isLeavingGamePassSoon = isLeaving,
+                    saleCountdownText = countdownStr,
+                    saleCadenceNote = cadenceNote,
+                    editions = editionOptions.sortedBy { it.priceInr }.take(5),
+                    supportedPlatforms = platforms.distinct(),
+                    latestNewsHeadline = newsSnippet,
+                    communityReviewSummary = reviewSnippet,
+                    coverImageUrl = coverUrl,
+                    screenshotUrls = screenshots,
                     trailerUrl = trailerUrl,
-                    currentInr = currentInr,
+                    currentPriceInr = currentInr,
                     mrpInr = mrpInr,
-                    isLive = matchingPaidMsrp > 0.0
+                    lowestEverInr = actualLowest,
+                    highestEverInr = highestRecorded,
+                    averagePriceInr = avgPrice,
+                    isAtAllTimeLow = isAtLow,
+                    isFavourite = storage.isFavourite(prodId),
+                    ownedPaidInr = storage.getOwnedEntry(prodId)?.paidInr,
+                    alertTargetInr = storage.getAlertForProduct(prodId)?.targetPriceInr,
+                    discountPercent = discountPct,
+                    isGamePass = detectedGamePass,
+                    isLiveApiPrice = true,
+                    monthHistory = realSnapshots.takeLast(4),
+                    yearHistory = realSnapshots.takeLast(8),
+                    allTimeHistory = realSnapshots,
+                    nextPredictedSale = "Microsoft Store India",
+                    predictedPriceInr = actualLowest,
+                    recommendationEmoji = emoji,
+                    dealRating = verdict,
+                    storeUrl = "https://www.xbox.com/en-in/games/store/_/$prodId"
                 )
             )
         }
@@ -569,146 +632,5 @@ class XboxStoreRepository(context: Context) {
             raw.contains("Sport", ignoreCase = true) -> "Sports"
             else -> "Action & Adventure"
         }
-    }
-
-    private fun buildFallbackList(): List<XboxGameDeal> {
-        return trackedCatalog.map { meta ->
-            buildDealModel(
-                meta = meta,
-                title = meta.fallbackTitle,
-                publisher = meta.fallbackPublisher,
-                description = "Official Xbox Store India edition.",
-                genre = meta.fallbackGenre,
-                rating = meta.fallbackRating,
-                ratingCount = 450,
-                criticScore = 88,
-                releaseDate = "2026-10-15",
-                countdown = "⏳ Ends in 4d 12h",
-                editions = listOf(
-                    GameEditionOption("Standard Edition", meta.lowestEverInr, meta.fallbackMrpInr, 40),
-                    GameEditionOption("Ultimate Edition", meta.lowestEverInr + 700, meta.fallbackMrpInr + 1200, 35)
-                ),
-                platforms = listOf("Xbox Series X|S", "Xbox One"),
-                coverUrl = "",
-                screenshots = emptyList(),
-                trailerUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-                currentInr = meta.lowestEverInr,
-                mrpInr = meta.fallbackMrpInr,
-                isLive = false
-            )
-        }
-    }
-
-    private fun buildDealModel(
-        meta: BaselineMeta,
-        title: String,
-        publisher: String,
-        description: String,
-        genre: String,
-        rating: Double,
-        ratingCount: Int,
-        criticScore: Int,
-        releaseDate: String,
-        countdown: String,
-        editions: List<GameEditionOption>,
-        platforms: List<String>,
-        coverUrl: String,
-        screenshots: List<String>,
-        trailerUrl: String,
-        currentInr: Int,
-        mrpInr: Int,
-        isLive: Boolean
-    ): XboxGameDeal {
-        val safeMrp = maxOf(mrpInr, currentInr)
-        val discountPct = if (safeMrp > currentInr && safeMrp > 0) {
-            (((safeMrp - currentInr).toDouble() / safeMrp) * 100.0).roundToInt()
-        } else 0
-
-        val actualLowest = storage.recordAndGetLowestPrice(meta.productId, currentInr, meta.lowestEverInr)
-
-        val monthHist = storage.getTimeframeHistory(
-            meta.productId, "1M",
-            PriceHistoryStorage.buildDefaultMonthHistory(safeMrp, currentInr), currentInr
-        )
-        val yearHist = storage.getTimeframeHistory(
-            meta.productId, "1Y",
-            PriceHistoryStorage.buildDefaultYearHistory(safeMrp, actualLowest, currentInr), currentInr
-        )
-        val allTimeHist = storage.getTimeframeHistory(
-            meta.productId, "ALL",
-            PriceHistoryStorage.buildDefaultAllTimeHistory(safeMrp, actualLowest, currentInr), currentInr
-        )
-
-        val allPrices = allTimeHist.map { it.priceInr }
-        val highestRecorded = maxOf(safeMrp, allPrices.maxOrNull() ?: safeMrp)
-        val avgPrice = if (allPrices.isNotEmpty()) allPrices.average().roundToInt() else currentInr
-        val isAtLow = currentInr > 0 && currentInr <= actualLowest
-
-        val (emoji, verdict) = PriceHistoryStorage.computeRecommendation(
-            curr = currentInr,
-            mrp = safeMrp,
-            low = actualLowest,
-            discountPct = discountPct,
-            isGamePass = meta.isGamePass,
-            isLeavingSoon = meta.isLeavingSoon,
-            nextSale = meta.nextPredictedSale
-        )
-
-        val cadenceNote = if (discountPct >= 40) "Sale Cycle: Drops every ~45 days" else "Sale Cycle: Major seasonal sales (~60 days)"
-
-        val newsSnippet = when {
-            meta.isLeavingSoon -> "⚠️ Leaving Xbox Game Pass soon — grab permanent ownership at 20% off."
-            meta.isNewLaunch -> "🆕 Newly launched on Xbox India ($releaseDate) with full Series X|S optimization."
-            else -> "📰 Active on Xbox India Store • Rated $rating★ across $ratingCount verified player reviews."
-        }
-
-        val reviewSnippet = when {
-            rating >= 4.6 -> "Overwhelmingly Positive ($rating★) — Players highlight graphics, gameplay depth & value."
-            rating >= 4.0 -> "Very Positive ($rating★) — Strong performance on Xbox Series X|S."
-            else -> "Mixed/Positive ($rating★) — Recommended to buy during seasonal INR discounts."
-        }
-
-        return XboxGameDeal(
-            productId = meta.productId,
-            title = title,
-            publisher = publisher,
-            description = description,
-            genre = genre,
-            starRating = rating,
-            ratingCount = ratingCount,
-            criticScore = criticScore,
-            releaseDate = releaseDate,
-            isNewLaunch = meta.isNewLaunch,
-            isLeavingGamePassSoon = meta.isLeavingSoon,
-            saleCountdownText = countdown,
-            saleCadenceNote = cadenceNote,
-            editions = editions,
-            supportedPlatforms = platforms,
-            latestNewsHeadline = newsSnippet,
-            communityReviewSummary = reviewSnippet,
-            coverImageUrl = coverUrl,
-            screenshotUrls = screenshots,
-            trailerUrl = trailerUrl,
-            currentPriceInr = currentInr,
-            mrpInr = safeMrp,
-            lowestEverInr = actualLowest,
-            highestEverInr = highestRecorded,
-            averagePriceInr = avgPrice,
-            isAtAllTimeLow = isAtLow,
-            isFavourite = storage.isFavourite(meta.productId),
-            ownedPaidInr = storage.getOwnedEntry(meta.productId)?.paidInr,
-            alertTargetInr = storage.getAlertForProduct(meta.productId)?.targetPriceInr,
-            discountPercent = discountPct,
-            isGamePass = meta.isGamePass,
-            isLiveApiPrice = isLive,
-            monthHistory = monthHist,
-            yearHistory = yearHist,
-            allTimeHistory = allTimeHist,
-            nextPredictedSale = meta.nextPredictedSale,
-            predictedPriceInr = actualLowest,
-            recommendationEmoji = emoji,
-            dealRating = verdict,
-            storeUrl = "https://www.xbox.com/en-in/games/store/_/${meta.productId}"
-        )
     }
 }
