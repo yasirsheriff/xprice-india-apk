@@ -32,7 +32,7 @@ class XboxNewsRepository(context: Context) {
         private const val XBOX_WIRE_RSS_URL = "https://news.xbox.com/en-us/feed/"
         private const val USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        private val IMG_SRC_REGEX = Regex("<img[^>]+src=[\\"']([^\\"']+)[\\"']", RegexOption.IGNORE_CASE)
+        private val IMG_SRC_REGEX = Regex("<img[^>]+src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
 
         fun extractGameSearchKeyword(headline: String): String {
             val cleaned = headline
@@ -167,7 +167,7 @@ class XboxNewsRepository(context: Context) {
                         insideItem = false
                         if (title.isNotBlank()) {
                             if (imageUrl.isBlank()) {
-                                val imgMatch = IMG_SRC_REGEX.find(encodedContent) ?: IMG_SRC_REGEX.find(description)
+        private val IMG_SRC_REGEX = Regex("<img[^>]+src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
                                 imageUrl = imgMatch?.groupValues?.getOrNull(1) ?: ""
                             }
                             val cleanTitle = stripHtml(title)
