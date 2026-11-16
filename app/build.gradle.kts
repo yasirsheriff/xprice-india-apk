@@ -12,8 +12,8 @@ android {
         applicationId = "in.xprice.tracker"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "4.0.1"
+        versionCode = 12
+        versionName = "5.0.0"
     }
 
     buildFeatures {
@@ -42,8 +42,6 @@ dependencies {
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
-
-    // Jetpack Glance for Android 15 Home Screen Widget
     implementation("androidx.glance:glance-appwidget:1.1.1")
     implementation("androidx.glance:glance-material3:1.1.1")
 }
