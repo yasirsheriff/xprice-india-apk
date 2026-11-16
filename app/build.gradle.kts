@@ -12,8 +12,8 @@ android {
         applicationId = "in.xprice.tracker"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.4.0"
+        versionCode = 7
+        versionName = "2.2.0"
     }
 
     buildFeatures {
@@ -38,6 +38,8 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-    // WorkManager for background price drop checks & notifications
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+    implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-ui:1.4.1")
 }
