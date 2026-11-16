@@ -144,7 +144,7 @@ class XboxStoreRepository(context: Context) {
 
             channels.forEach { url ->
                 httpGetText(url)?.let { body ->
-                    PRODUCT_ID_REGEX.findAll(body).forEach { match ->
+        private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
                         if (ids.size < 75) ids.add(match.value)
                     }
                 }
@@ -173,7 +173,7 @@ class XboxStoreRepository(context: Context) {
             val newUrl = "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/New" +
                 "?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=40"
             httpGetText(newUrl)?.let { body ->
-                PRODUCT_ID_REGEX.findAll(body).forEach { match ->
+        private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
                     if (ids.size < 45) ids.add(match.value)
                 }
             }
@@ -202,7 +202,7 @@ class XboxStoreRepository(context: Context) {
             val dealUrl = "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/Deal" +
                 "?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=45"
             httpGetText(dealUrl)?.let { body ->
-                PRODUCT_ID_REGEX.findAll(body).forEach { match ->
+        private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
                     if (ids.size < 50) ids.add(match.value)
                 }
             }
@@ -229,7 +229,7 @@ class XboxStoreRepository(context: Context) {
             val leavingSoonIds = LinkedHashSet<String>()
             val leavingUrl = "https://catalog.gamepass.com/sigls/v2?id=393f05bf-e596-4ef6-9487-6d4fa0eab987&language=en-in&market=IN"
             httpGetText(leavingUrl)?.let { rawLeaving ->
-                PRODUCT_ID_REGEX.findAll(rawLeaving).forEach { leavingSoonIds.add(it.value) }
+        private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
             }
 
             val gamePassIds = LinkedHashSet<String>()
@@ -238,7 +238,7 @@ class XboxStoreRepository(context: Context) {
             val recoGamePassUrl = "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Collection/XboxGamePass" +
                 "?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=40"
             httpGetText(recoGamePassUrl)?.let { body ->
-                PRODUCT_ID_REGEX.findAll(body).forEach { match ->
+        private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
                     if (gamePassIds.size < 50) gamePassIds.add(match.value)
                 }
             }
@@ -246,7 +246,7 @@ class XboxStoreRepository(context: Context) {
             if (gamePassIds.size < 25) {
                 val siglUrl = "https://catalog.gamepass.com/sigls/v2?id=f6f1f99f-9b49-4ccd-b3bf-4d9767a77f5e&language=en-in&market=IN"
                 httpGetText(siglUrl)?.let { rawSigl ->
-                    PRODUCT_ID_REGEX.findAll(rawSigl).forEach { match ->
+        private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
                         if (gamePassIds.size < 50) gamePassIds.add(match.value)
                     }
                 }
@@ -280,7 +280,7 @@ class XboxStoreRepository(context: Context) {
             val catalogSuggestUrl = "https://displaycatalog.mp.microsoft.com/v7.0/productFamilies/autosuggest" +
                 "?market=IN&languages=en-in&query=$encodedQuery&top=15"
             httpGetText(catalogSuggestUrl, 6000)?.let { raw ->
-                PRODUCT_ID_REGEX.findAll(raw).forEach { discoveredIds.add(it.value) }
+        private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
             }
 
             if (discoveredIds.size < 8) {
@@ -288,7 +288,7 @@ class XboxStoreRepository(context: Context) {
                     "?market=en-IN&clientId=7F27B536-CF6B-4C65-8638-A0F8CBDFCA65" +
                     "&sources=Iris-Products,xSearch-Products&filter=+ClientType:StoreWeb&counts=10,10&query=$encodedQuery"
                 httpGetText(webSuggestUrl, 6000)?.let { raw ->
-                    PRODUCT_ID_REGEX.findAll(raw).forEach { discoveredIds.add(it.value) }
+        private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
                 }
             }
 
