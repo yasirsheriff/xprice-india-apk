@@ -309,17 +309,17 @@ private fun GameList(vm: MainViewModel, games: List<XboxGameDeal>) {
             modifier = Modifier.fillMaxSize()
         ) {
             items(games, key = { it.productId }) { g ->
-                GameGridCard(g, g.productId in compareIds, { vm.toggleFavourite(g.productId) }, { vm.toggleCompare(g) }) { vm.selectedGameId = g.productId }
+                GameGridCard(g, g.productId in compareIds, { vm.toggleFavourite(g.productId) }, { vm.toggleCompare(g) }) { vm.openGame(g.productId) }
             }
         }
         ViewLayoutMode.LIST -> LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = bottom, modifier = Modifier.fillMaxSize()) {
             items(games, key = { it.productId }) { g ->
-                GameListRow(g, g.productId in compareIds, { vm.toggleFavourite(g.productId) }, { vm.toggleCompare(g) }) { vm.selectedGameId = g.productId }
+                GameListRow(g, g.productId in compareIds, { vm.toggleFavourite(g.productId) }, { vm.toggleCompare(g) }) { vm.openGame(g.productId) }
             }
         }
         ViewLayoutMode.DETAILED -> LazyColumn(verticalArrangement = Arrangement.spacedBy(14.dp), contentPadding = bottom, modifier = Modifier.fillMaxSize()) {
             items(games, key = { it.productId }) { g ->
-                GameDetailedCard(g, g.productId in compareIds, { vm.toggleFavourite(g.productId) }, { vm.toggleCompare(g) }) { vm.selectedGameId = g.productId }
+                GameDetailedCard(g, g.productId in compareIds, { vm.toggleFavourite(g.productId) }, { vm.toggleCompare(g) }) { vm.openGame(g.productId) }
             }
         }
     }

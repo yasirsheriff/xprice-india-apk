@@ -118,6 +118,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     init {
         CatalogKey.entries.forEach { catalogs[it] = repository.getInstantCache(it) }
         load(CatalogKey.ALL)
+        viewModelScope.launch {
+            if (repository.syncSharedHistory(storage.trackedProductIds()) > 0) reEnrichAll()
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -313,6 +316,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             else -> current + game
         }
         if (compareSelection.size == 1) messageChannel.trySend("Pick one more game to compare")
+    }
+
+    /** Opens the detail sheet and pulls this game's shared daily history in the background. */
+    fun openGame(productId: String) {
+        selectedGameId = productId
+        viewModelScope.launch {
+            if (repository.syncSharedHistory(listOf(productId)) > 0) reEnrichAll()
+        }
     }
 
     fun clearCompare() {

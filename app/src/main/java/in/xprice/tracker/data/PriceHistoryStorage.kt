@@ -240,6 +240,22 @@ class PriceHistoryStorage(context: Context) {
         return points
     }
 
+    /**
+     * Merges dated points from another source (shared tracker, Microsoft best-price windows)
+     * into local history. On the same day, local observations win.
+     */
+    fun mergePoints(productId: String, extra: List<PricePoint>) {
+        if (extra.isEmpty()) return
+        val merged = normalizeRuns(extra.filter { it.priceInr > 0 } + getHistory(productId))
+        saveHistory(productId, merged)
+    }
+
+    // --- Shared history sync bookkeeping ---
+    fun remoteHistoryFetchedAt(productId: String): Long = prefs.getLong("remote_hist_ts_$productId", 0L)
+    fun markRemoteHistoryFetched(productId: String) {
+        prefs.edit().putLong("remote_hist_ts_$productId", System.currentTimeMillis()).apply()
+    }
+
     /** Converts the old "dd MMM" label snapshots (no year) into dated points, once. */
     private fun migrateLegacyHistory(productId: String): List<PricePoint> {
         val legacyRaw = prefs.getString("real_snapshots_$productId", null) ?: return emptyList()
@@ -515,6 +531,20 @@ class PriceHistoryStorage(context: Context) {
         const val APP_NAME = "Lootwise"
         private const val MAX_HISTORY_POINTS = 400
         val PRODUCT_ID_REGEX = Regex("^[9BC][A-Z0-9]{11}$")
+
+        /**
+         * Sorts by day (later entries win on the same day) and keeps only the first and last
+         * day of each run of equal prices.
+         */
+        fun normalizeRuns(points: List<PricePoint>): List<PricePoint> {
+            val byDay = LinkedHashMap<Long, Int>()
+            points.forEach { byDay[it.epochDay] = it.priceInr }
+            val sorted = byDay.entries.sortedBy { it.key }.map { PricePoint(it.key, it.value) }
+            return sorted.filterIndexed { i, p ->
+                i == 0 || i == sorted.lastIndex ||
+                    sorted[i - 1].priceInr != p.priceInr || sorted[i + 1].priceInr != p.priceInr
+            }
+        }
 
         fun computeVerdict(d: XboxGameDeal, atLow: Boolean): DealVerdict = when {
             d.isUnreleasedOrNoPrice || d.currentPriceInr < 0 -> DealVerdict.COMING_SOON
