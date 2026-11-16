@@ -5,6 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 data class TargetPriceAlert(
     val productId: String,
@@ -15,93 +16,111 @@ data class TargetPriceAlert(
 data class OwnedVaultEntry(
     val productId: String,
     val title: String,
-    val paidInr: Int,
+    /** What the user actually paid. null when unknown (e.g. imported from Xbox history). */
+    val paidInr: Int?,
     val mrpInr: Int,
+    /** Today's Microsoft Store India price, refreshed on each Xbox sync. */
+    val currentInr: Int,
     val hoursPlayed: Double,
-    val achievementsPct: Int
+    val achievementsPct: Int,
+    val imageUrl: String = "",
+    val fromXbox: Boolean = false,
+    val lastPlayed: String = ""
 )
 
 data class XboxPlayerProfile(
     val gamertag: String,
     val xuid: String,
     val gamerscore: Int,
-    val accountTier: String,
-    val isConnected: Boolean
+    val avatarUrl: String,
+    val isConnected: Boolean,
+    val lastSyncMs: Long
 )
 
+/**
+ * All on-device persistence. SharedPreferences file name is kept from earlier versions
+ * so existing favourites, alerts and library survive the upgrade.
+ */
 class PriceHistoryStorage(context: Context) {
-    private val prefs = context.getSharedPreferences("rupeevault_x_v6_real_ledger", Context.MODE_PRIVATE)
+    private val prefs = context.applicationContext
+        .getSharedPreferences("rupeevault_x_v6_real_ledger", Context.MODE_PRIVATE)
 
-    // --- 1. Xbox Live Account Profile ---
-    fun saveXboxProfile(gamertag: String, xuid: String, gamerscore: Int, tier: String) {
+    // ---------------------------------------------------------------------
+    // Xbox profile
+    // ---------------------------------------------------------------------
+    fun saveXboxProfile(gamertag: String, xuid: String, gamerscore: Int, avatarUrl: String) {
         prefs.edit()
             .putString("xbl_gamertag", gamertag)
             .putString("xbl_xuid", xuid)
             .putInt("xbl_gamerscore", gamerscore)
-            .putString("xbl_tier", tier)
+            .putString("xbl_avatar", avatarUrl)
             .putBoolean("xbl_connected", gamertag.isNotBlank())
+            .putLong("xbl_last_sync", System.currentTimeMillis())
             .apply()
     }
 
-    fun getXboxProfile(): XboxPlayerProfile {
-        return XboxPlayerProfile(
-            gamertag = prefs.getString("xbl_gamertag", "") ?: "",
-            xuid = prefs.getString("xbl_xuid", "") ?: "",
-            gamerscore = prefs.getInt("xbl_gamerscore", 0),
-            accountTier = prefs.getString("xbl_tier", "Xbox Live Member") ?: "Xbox Live Member",
-            isConnected = prefs.getBoolean("xbl_connected", false)
-        )
-    }
+    fun getXboxProfile(): XboxPlayerProfile = XboxPlayerProfile(
+        gamertag = prefs.getString("xbl_gamertag", "") ?: "",
+        xuid = prefs.getString("xbl_xuid", "") ?: "",
+        gamerscore = prefs.getInt("xbl_gamerscore", 0),
+        avatarUrl = prefs.getString("xbl_avatar", "") ?: "",
+        isConnected = prefs.getBoolean("xbl_connected", false),
+        lastSyncMs = prefs.getLong("xbl_last_sync", 0L)
+    )
 
+    /** Signs out and removes games that were imported from Xbox (manual entries are kept). */
     fun disconnectXboxProfile() {
-        prefs.edit().putBoolean("xbl_connected", false).apply()
+        prefs.edit()
+            .remove("xbl_gamertag").remove("xbl_xuid").remove("xbl_gamerscore")
+            .remove("xbl_avatar").remove("xbl_last_sync")
+            .putBoolean("xbl_connected", false)
+            .apply()
+        saveOwnedVault(getOwnedVault().filterValues { !it.fromXbox })
     }
 
-    // --- 2. Favourites ---
-    fun isFavourite(productId: String): Boolean = getFavouriteIds().contains(productId)
+    // ---------------------------------------------------------------------
+    // Favourites
+    // ---------------------------------------------------------------------
+    fun getFavouriteIds(): Set<String> = prefs.getStringSet("favourite_ids", emptySet()) ?: emptySet()
 
     fun toggleFavourite(productId: String): Boolean {
         val current = getFavouriteIds().toMutableSet()
-        val nowFav = if (current.contains(productId)) {
-            current.remove(productId)
-            false
-        } else {
-            current.add(productId)
-            true
-        }
+        val nowFav = current.add(productId) || run { current.remove(productId); false }
         prefs.edit().putStringSet("favourite_ids", current).apply()
         return nowFav
     }
 
-    fun getFavouriteIds(): Set<String> = prefs.getStringSet("favourite_ids", emptySet()) ?: emptySet()
-
-    // --- 3. Owned Vault & Real Playtime Tracker ---
-    fun markGameOwned(
-        productId: String,
-        title: String,
-        paidInr: Int,
-        mrpInr: Int,
-        hoursPlayed: Double = 0.0,
-        achievementsPct: Int = 0
-    ) {
+    // ---------------------------------------------------------------------
+    // Owned library
+    // ---------------------------------------------------------------------
+    fun markGameOwned(productId: String, title: String, paidInr: Int, mrpInr: Int, currentInr: Int, imageUrl: String) {
         val vault = getOwnedVault().toMutableMap()
         val existing = vault[productId]
         vault[productId] = OwnedVaultEntry(
             productId = productId,
             title = title,
             paidInr = paidInr.coerceAtLeast(0),
-            mrpInr = maxOf(paidInr.coerceAtLeast(0), mrpInr.coerceAtLeast(0)),
-            hoursPlayed = if (hoursPlayed > 0.0) hoursPlayed else (existing?.hoursPlayed ?: 0.0),
-            achievementsPct = if (achievementsPct > 0) achievementsPct else (existing?.achievementsPct ?: 0)
+            mrpInr = maxOf(mrpInr, paidInr, 0),
+            currentInr = currentInr.coerceAtLeast(0),
+            hoursPlayed = existing?.hoursPlayed ?: 0.0,
+            achievementsPct = existing?.achievementsPct ?: 0,
+            imageUrl = imageUrl.ifBlank { existing?.imageUrl ?: "" },
+            fromXbox = existing?.fromXbox ?: false,
+            lastPlayed = existing?.lastPlayed ?: ""
         )
         saveOwnedVault(vault)
     }
 
-    fun updatePlaytimeHours(productId: String, deltaHours: Double) {
+    /** Merges titles from Xbox Live, keeping any price the user entered manually. */
+    fun mergeXboxLibrary(entries: List<OwnedVaultEntry>) {
         val vault = getOwnedVault().toMutableMap()
-        val existing = vault[productId] ?: return
-        val updatedHours = (existing.hoursPlayed + deltaHours).coerceAtLeast(0.0)
-        vault[productId] = existing.copy(hoursPlayed = updatedHours)
+        entries.forEach { incoming ->
+            val existing = vault[incoming.productId]
+            vault[incoming.productId] = incoming.copy(
+                paidInr = existing?.paidInr ?: incoming.paidInr,
+                mrpInr = if (incoming.mrpInr > 0) incoming.mrpInr else existing?.mrpInr ?: 0
+            )
+        }
         saveOwnedVault(vault)
     }
 
@@ -111,25 +130,31 @@ class PriceHistoryStorage(context: Context) {
         saveOwnedVault(vault)
     }
 
-    fun getOwnedEntry(productId: String): OwnedVaultEntry? = getOwnedVault()[productId]
-
     fun getOwnedVault(): Map<String, OwnedVaultEntry> {
         val raw = prefs.getString("owned_vault_entries", null) ?: return emptyMap()
-        val map = mutableMapOf<String, OwnedVaultEntry>()
-        val arr = JSONArray(raw)
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            val id = o.getString("id")
-            map[id] = OwnedVaultEntry(
-                productId = id,
-                title = o.getString("title"),
-                paidInr = o.getInt("paid"),
-                mrpInr = o.getInt("mrp"),
-                hoursPlayed = o.optDouble("hours", 0.0),
-                achievementsPct = o.optInt("ach", 0)
-            )
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).associate { i ->
+                val o = arr.getJSONObject(i)
+                val id = o.getString("id")
+                val paid = if (o.has("paid") && !o.isNull("paid")) o.getInt("paid") else null
+                id to OwnedVaultEntry(
+                    productId = id,
+                    title = o.optString("title"),
+                    // Older versions stored the live price as "paid" for Xbox imports.
+                    paidInr = if (o.optBoolean("xbox", false) && !o.has("cur")) null else paid,
+                    mrpInr = o.optInt("mrp", 0),
+                    currentInr = o.optInt("cur", paid ?: 0),
+                    hoursPlayed = o.optDouble("hours", 0.0),
+                    achievementsPct = o.optInt("ach", 0),
+                    imageUrl = o.optString("img", ""),
+                    fromXbox = o.optBoolean("xbox", false),
+                    lastPlayed = o.optString("last", "")
+                )
+            }
+        } catch (_: Exception) {
+            emptyMap()
         }
-        return map
     }
 
     private fun saveOwnedVault(map: Map<String, OwnedVaultEntry>) {
@@ -138,83 +163,151 @@ class PriceHistoryStorage(context: Context) {
             arr.put(JSONObject().apply {
                 put("id", e.productId)
                 put("title", e.title)
-                put("paid", e.paidInr)
+                if (e.paidInr != null) put("paid", e.paidInr)
                 put("mrp", e.mrpInr)
+                put("cur", e.currentInr)
                 put("hours", e.hoursPlayed)
                 put("ach", e.achievementsPct)
+                put("img", e.imageUrl)
+                put("xbox", e.fromXbox)
+                put("last", e.lastPlayed)
             })
         }
         prefs.edit().putString("owned_vault_entries", arr.toString()).apply()
     }
 
-    // --- 4. 100% Real Microsoft API Price History Ledger (Zero Fake Simulated Data) ---
-    fun recordAndGetLowestPrice(productId: String, currentInr: Int, mrpInr: Int): Int {
-        if (currentInr <= 0) return 0
-        val key = "real_lowest_$productId"
-        val savedLowest = prefs.getInt(key, currentInr)
-        val trueLowest = if (savedLowest > 0) minOf(savedLowest, currentInr) else currentInr
-        if (trueLowest != savedLowest || !prefs.contains(key)) {
-            prefs.edit().putInt(key, trueLowest).apply()
-        }
-        return trueLowest
-    }
+    // ---------------------------------------------------------------------
+    // Price history
+    //
+    // Stored as change points: each price "run" keeps its first and last day seen,
+    // so a game that sat at ₹3,499 for 200 days costs two entries, not 200.
+    // ---------------------------------------------------------------------
+    private fun historyKey(productId: String) = "price_hist_v2_$productId"
 
-    fun recordRealApiPriceSnapshot(productId: String, mrpInr: Int, livePriceInr: Int): List<PricePoint> {
-        if (livePriceInr < 0) return emptyList()
-        val key = "real_snapshots_$productId"
-        val rawJson = prefs.getString(key, null)
-        val points = mutableListOf<PricePoint>()
-
-        if (rawJson != null) {
-            try {
-                val arr = JSONArray(rawJson)
-                for (i in 0 until arr.length()) {
-                    val obj = arr.getJSONObject(i)
-                    points.add(PricePoint(obj.getString("label"), obj.getInt("price")))
-                }
-            } catch (_: Exception) {}
-        }
-
-        // Seed first point with official Microsoft Store MRP if this is the first time seeing the game
-        if (points.isEmpty() && mrpInr > 0) {
-            points.add(PricePoint("MSRP", mrpInr))
-        }
-
-        val todayLabel = try {
-            LocalDate.now().format(DateTimeFormatter.ofPattern("dd MMM"))
+    fun getHistory(productId: String): List<PricePoint> {
+        val raw = prefs.getString(historyKey(productId), null)
+        if (raw == null) return migrateLegacyHistory(productId)
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val pair = arr.getJSONArray(i)
+                PricePoint(pair.getLong(0), pair.getInt(1))
+            }
         } catch (_: Exception) {
-            "Live"
+            emptyList()
         }
-
-        if (points.isNotEmpty() && points.last().label == todayLabel) {
-            points[points.lastIndex] = PricePoint(todayLabel, livePriceInr)
-        } else {
-            points.add(PricePoint(todayLabel, livePriceInr))
-        }
-
-        val capped = points.takeLast(12)
-        val saveArr = JSONArray()
-        capped.forEach { pt ->
-            saveArr.put(JSONObject().apply {
-                put("label", pt.label)
-                put("price", pt.priceInr)
-            })
-        }
-        prefs.edit().putString(key, saveArr.toString()).apply()
-        return capped
     }
 
-    // --- 5. Offline Catalog Cache (With Timestamp for Fast Startup) ---
+    private fun saveHistory(productId: String, points: List<PricePoint>) {
+        val arr = JSONArray()
+        points.takeLast(MAX_HISTORY_POINTS).forEach { arr.put(JSONArray().put(it.epochDay).put(it.priceInr)) }
+        prefs.edit().putString(historyKey(productId), arr.toString()).apply()
+    }
+
+    /**
+     * Records a LIVE price observation (only call with fresh Microsoft Store data,
+     * never with cached data, or stale prices get written as today's).
+     */
+    fun recordPrice(productId: String, priceInr: Int, today: Long = LocalDate.now().toEpochDay()): List<PricePoint> {
+        val points = getHistory(productId).toMutableList()
+        if (priceInr <= 0) return points
+
+        val last = points.lastOrNull()
+        when {
+            last == null -> points.add(PricePoint(today, priceInr))
+            last.epochDay > today -> return points // device clock went backwards, ignore
+            last.epochDay == today -> {
+                points[points.lastIndex] = PricePoint(today, priceInr)
+                // Collapse if the replacement now equals the previous run.
+                val prev = points.getOrNull(points.lastIndex - 1)
+                val prevPrev = points.getOrNull(points.lastIndex - 2)
+                if (prev != null && prevPrev != null && prev.priceInr == priceInr && prevPrev.priceInr == priceInr) {
+                    points.removeAt(points.lastIndex - 1)
+                }
+            }
+            last.priceInr == priceInr -> {
+                val prev = points.getOrNull(points.lastIndex - 1)
+                if (prev != null && prev.priceInr == priceInr) {
+                    // Extend the existing run to today.
+                    points[points.lastIndex] = PricePoint(today, priceInr)
+                } else {
+                    points.add(PricePoint(today, priceInr))
+                }
+            }
+            else -> points.add(PricePoint(today, priceInr))
+        }
+        saveHistory(productId, points)
+        return points
+    }
+
+    /** Converts the old "dd MMM" label snapshots (no year) into dated points, once. */
+    private fun migrateLegacyHistory(productId: String): List<PricePoint> {
+        val legacyRaw = prefs.getString("real_snapshots_$productId", null) ?: return emptyList()
+        val fmt = DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ENGLISH)
+        val today = LocalDate.now()
+        val migrated = mutableListOf<PricePoint>()
+        try {
+            val arr = JSONArray(legacyRaw)
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val label = obj.optString("label")
+                val price = obj.optInt("price", -1)
+                if (price <= 0 || label == "MSRP" || label == "Live") continue
+                var date = try { LocalDate.parse("$label ${today.year}", fmt) } catch (_: Exception) { null } ?: continue
+                if (date.isAfter(today)) date = date.minusYears(1)
+                migrated.add(PricePoint(date.toEpochDay(), price))
+            }
+        } catch (_: Exception) {
+        }
+        val sorted = migrated.sortedBy { it.epochDay }.distinctBy { it.epochDay }
+        prefs.edit().remove("real_snapshots_$productId").apply()
+        if (sorted.isNotEmpty()) saveHistory(productId, sorted)
+        return sorted
+    }
+
+    private fun legacyLowest(productId: String): Int = prefs.getInt("real_lowest_$productId", 0)
+
+    // ---------------------------------------------------------------------
+    // Enrichment: attach user state + tracked history to store data
+    // ---------------------------------------------------------------------
+    fun enrich(deals: List<XboxGameDeal>): List<XboxGameDeal> {
+        if (deals.isEmpty()) return deals
+        val favs = getFavouriteIds()
+        val alerts = getAllAlerts()
+        val owned = getOwnedVault()
+        return deals.map { d ->
+            val history = getHistory(d.productId)
+            val tracked = history.map { it.priceInr }.filter { it > 0 }
+            val legacyLow = legacyLowest(d.productId).takeIf { it > 0 }
+            val lowest = listOfNotNull(tracked.minOrNull(), legacyLow, d.currentPriceInr.takeIf { it > 0 }).minOrNull() ?: 0
+            val highest = maxOf(d.mrpInr, tracked.maxOrNull() ?: 0, d.currentPriceInr)
+            val atLow = d.currentPriceInr > 0 && d.discountPercent > 0 && d.currentPriceInr <= lowest
+            d.copy(
+                isFavourite = favs.contains(d.productId),
+                ownedPaidInr = owned[d.productId]?.let { it.paidInr ?: it.currentInr },
+                alertTargetInr = alerts[d.productId]?.targetPriceInr,
+                history = history,
+                lowestEverInr = lowest,
+                highestEverInr = highest,
+                isAtAllTimeLow = atLow,
+                verdict = computeVerdict(d, atLow)
+            )
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Catalog cache (fast startup / offline)
+    // ---------------------------------------------------------------------
     fun isCacheFresh(cacheKey: String, maxAgeMinutes: Int = 30): Boolean {
         val lastSync = prefs.getLong("ts_$cacheKey", 0L)
-        if (lastSync == 0L) return false
-        val ageMs = System.currentTimeMillis() - lastSync
-        return ageMs < (maxAgeMinutes * 60 * 1000L)
+        return lastSync != 0L && System.currentTimeMillis() - lastSync < maxAgeMinutes * 60_000L
     }
+
+    fun cacheTimestamp(cacheKey: String): Long = prefs.getLong("ts_$cacheKey", 0L)
 
     fun saveCachedDeals(deals: List<XboxGameDeal>, cacheKey: String) {
         val arr = JSONArray()
-        deals.take(80).forEach { d ->
+        deals.take(120).forEach { d ->
             val edArr = JSONArray()
             d.editions.forEach { ed ->
                 edArr.put(JSONObject().apply {
@@ -232,27 +325,20 @@ class PriceHistoryStorage(context: Context) {
                 put("genre", d.genre)
                 put("starRating", d.starRating)
                 put("ratingCount", d.ratingCount)
-                put("criticScore", d.criticScore)
                 put("releaseDate", d.releaseDate)
                 put("isNewLaunch", d.isNewLaunch)
                 put("isUnreleasedOrNoPrice", d.isUnreleasedOrNoPrice)
                 put("isLeavingGamePassSoon", d.isLeavingGamePassSoon)
-                put("saleCountdown", d.saleCountdownText)
-                put("saleCadence", d.saleCadenceNote)
+                put("saleEndsAtMs", d.saleEndsAtMs)
                 put("editions", edArr)
                 put("platforms", JSONArray(d.supportedPlatforms))
-                put("newsHeadline", d.latestNewsHeadline)
-                put("communitySummary", d.communityReviewSummary)
                 put("coverUrl", d.coverImageUrl)
                 put("screenshots", JSONArray(d.screenshotUrls))
                 put("trailerUrl", d.trailerUrl)
                 put("currentPriceInr", d.currentPriceInr)
                 put("mrpInr", d.mrpInr)
-                put("lowestEverInr", d.lowestEverInr)
-                put("highestEverInr", d.highestEverInr)
-                put("averagePriceInr", d.averagePriceInr)
+                put("discountPct", d.discountPercent)
                 put("isGamePass", d.isGamePass)
-                put("nextPredictedSale", d.nextPredictedSale)
                 put("storeUrl", d.storeUrl)
             })
         }
@@ -266,89 +352,60 @@ class PriceHistoryStorage(context: Context) {
         val raw = prefs.getString(cacheKey, null) ?: return emptyList()
         return try {
             val arr = JSONArray(raw)
-            val list = mutableListOf<XboxGameDeal>()
-            for (i in 0 until arr.length()) {
+            val list = (0 until arr.length()).map { i ->
                 val o = arr.getJSONObject(i)
                 val pid = o.getString("productId")
                 val curr = o.getInt("currentPriceInr")
-                val mrp = o.getInt("mrpInr")
-                val low = o.getInt("lowestEverInr")
-                val isUnpriced = o.optBoolean("isUnreleasedOrNoPrice", curr < 0)
+                val mrp = o.optInt("mrpInr", 0)
+                val discount = o.optInt(
+                    "discountPct",
+                    if (mrp > curr && curr > 0) (((mrp - curr).toDouble() / mrp) * 100).toInt() else 0
+                )
                 val shotsArr = o.optJSONArray("screenshots") ?: JSONArray()
-                val shots = (0 until shotsArr.length()).map { shotsArr.getString(it) }
                 val platArr = o.optJSONArray("platforms") ?: JSONArray()
-                val plats = (0 until platArr.length()).map { platArr.getString(it) }
-
                 val edArr = o.optJSONArray("editions") ?: JSONArray()
-                val eds = (0 until edArr.length()).map { idx ->
-                    val eo = edArr.getJSONObject(idx)
-                    GameEditionOption(eo.getString("skuTitle"), eo.getInt("priceInr"), eo.getInt("mrpInr"), eo.getInt("discountPct"))
-                }
-
-                val discount = if (mrp > curr && mrp > 0 && curr >= 0) (((mrp - curr).toDouble() / mrp) * 100).toInt() else 0
-                val isPass = o.optBoolean("isGamePass", false)
-                val isLeaving = o.optBoolean("isLeavingGamePassSoon", false)
-                val nextSale = o.optString("nextPredictedSale", "Microsoft Store India")
-
-                val realSnapshots = recordRealApiPriceSnapshot(pid, mrp, curr)
-                val rec = computeRecommendation(curr, mrp, low, discount, isPass, isLeaving, isUnpriced)
-
-                list.add(
-                    XboxGameDeal(
-                        productId = pid,
-                        title = o.getString("title"),
-                        publisher = o.optString("publisher", "Xbox Publisher"),
-                        description = o.optString("description", "Official Xbox India digital title."),
-                        genre = o.optString("genre", "Action & Adventure"),
-                        starRating = o.optDouble("starRating", 0.0),
-                        ratingCount = o.optInt("ratingCount", 0),
-                        criticScore = o.optInt("criticScore", 0),
-                        releaseDate = o.optString("releaseDate", "TBA"),
-                        isNewLaunch = o.optBoolean("isNewLaunch", false),
-                        isUnreleasedOrNoPrice = isUnpriced,
-                        isLeavingGamePassSoon = isLeaving,
-                        saleCountdownText = o.optString("saleCountdown", ""),
-                        saleCadenceNote = o.optString("saleCadence", "Official Microsoft Store IN Price"),
-                        editions = eds,
-                        supportedPlatforms = if (plats.isNotEmpty()) plats else listOf("Xbox Series X|S"),
-                        latestNewsHeadline = o.optString("newsHeadline", ""),
-                        communityReviewSummary = o.optString("communitySummary", ""),
-                        coverImageUrl = o.optString("coverUrl", ""),
-                        screenshotUrls = shots,
-                        trailerUrl = o.optString("trailerUrl", ""),
-                        currentPriceInr = curr,
-                        mrpInr = mrp,
-                        lowestEverInr = low,
-                        highestEverInr = o.optInt("highestEverInr", mrp),
-                        averagePriceInr = o.optInt("averagePriceInr", curr.coerceAtLeast(0)),
-                        isAtAllTimeLow = curr > 0 && curr <= low,
-                        isFavourite = isFavourite(pid),
-                        ownedPaidInr = getOwnedEntry(pid)?.paidInr,
-                        alertTargetInr = getAlertForProduct(pid)?.targetPriceInr,
-                        discountPercent = discount,
-                        isGamePass = isPass,
-                        isLiveApiPrice = true,
-                        monthHistory = realSnapshots.takeLast(4),
-                        yearHistory = realSnapshots.takeLast(8),
-                        allTimeHistory = realSnapshots,
-                        nextPredictedSale = nextSale,
-                        predictedPriceInr = low,
-                        recommendationEmoji = rec.first,
-                        dealRating = rec.second,
-                        storeUrl = o.optString("storeUrl", "https://www.xbox.com/en-in/games/store/_/$pid")
-                    )
+                XboxGameDeal(
+                    productId = pid,
+                    title = o.getString("title"),
+                    publisher = o.optString("publisher", ""),
+                    description = o.optString("description", ""),
+                    genre = o.optString("genre", "Action & Adventure"),
+                    starRating = o.optDouble("starRating", 0.0),
+                    ratingCount = o.optInt("ratingCount", 0),
+                    releaseDate = o.optString("releaseDate", "TBA"),
+                    isNewLaunch = o.optBoolean("isNewLaunch", false),
+                    isUnreleasedOrNoPrice = o.optBoolean("isUnreleasedOrNoPrice", curr < 0),
+                    isLeavingGamePassSoon = o.optBoolean("isLeavingGamePassSoon", false),
+                    saleEndsAtMs = o.optLong("saleEndsAtMs", 0L),
+                    editions = (0 until edArr.length()).map { idx ->
+                        val eo = edArr.getJSONObject(idx)
+                        GameEditionOption(eo.getString("skuTitle"), eo.getInt("priceInr"), eo.getInt("mrpInr"), eo.getInt("discountPct"))
+                    },
+                    supportedPlatforms = (0 until platArr.length()).map { platArr.getString(it) },
+                    coverImageUrl = o.optString("coverUrl", ""),
+                    screenshotUrls = (0 until shotsArr.length()).map { shotsArr.getString(it) },
+                    trailerUrl = o.optString("trailerUrl", ""),
+                    currentPriceInr = curr,
+                    mrpInr = mrp,
+                    discountPercent = discount,
+                    isGamePass = o.optBoolean("isGamePass", false),
+                    storeUrl = o.optString("storeUrl", "https://www.xbox.com/en-in/games/store/_/$pid")
                 )
             }
-            list
-        } catch (e: Exception) {
+            enrich(list)
+        } catch (_: Exception) {
             emptyList()
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Price alerts
+    // ---------------------------------------------------------------------
     fun setPriceAlert(productId: String, title: String, targetInr: Int) {
         val alerts = getAllAlerts().toMutableMap()
         alerts[productId] = TargetPriceAlert(productId, title, targetInr)
         saveAlertsMap(alerts)
+        prefs.edit().remove("notified_$productId").apply()
     }
 
     fun removePriceAlert(productId: String) {
@@ -357,18 +414,18 @@ class PriceHistoryStorage(context: Context) {
         saveAlertsMap(alerts)
     }
 
-    fun getAlertForProduct(productId: String): TargetPriceAlert? = getAllAlerts()[productId]
-
     fun getAllAlerts(): Map<String, TargetPriceAlert> {
         val raw = prefs.getString("active_alerts", null) ?: return emptyMap()
-        val map = mutableMapOf<String, TargetPriceAlert>()
-        val arr = JSONArray(raw)
-        for (i in 0 until arr.length()) {
-            val obj = arr.getJSONObject(i)
-            val id = obj.getString("id")
-            map[id] = TargetPriceAlert(id, obj.getString("title"), obj.getInt("target"))
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).associate { i ->
+                val obj = arr.getJSONObject(i)
+                val id = obj.getString("id")
+                id to TargetPriceAlert(id, obj.getString("title"), obj.getInt("target"))
+            }
+        } catch (_: Exception) {
+            emptyMap()
         }
-        return map
     }
 
     private fun saveAlertsMap(map: Map<String, TargetPriceAlert>) {
@@ -383,20 +440,40 @@ class PriceHistoryStorage(context: Context) {
         prefs.edit().putString("active_alerts", arr.toString()).apply()
     }
 
+    /** Returns true if we haven't already notified for this exact price (avoids repeat pings every 12h). */
+    fun shouldNotify(productId: String, priceInr: Int): Boolean {
+        val last = prefs.getInt("notified_$productId", -1)
+        if (last == priceInr) return false
+        prefs.edit().putInt("notified_$productId", priceInr).apply()
+        return true
+    }
+
+    /** Every product the user cares about; the background worker tracks these daily. */
+    fun trackedProductIds(): Set<String> =
+        getFavouriteIds() + getAllAlerts().keys + getOwnedVault().keys.filter { PRODUCT_ID_REGEX.matches(it) }
+
+    // ---------------------------------------------------------------------
+    // Export
+    // ---------------------------------------------------------------------
     fun exportWatchlistAsCsv(allKnownGames: List<XboxGameDeal>): String {
+        fun esc(s: String) = "\"" + s.replace("\"", "\"\"") + "\""
         val sb = StringBuilder()
-        sb.appendLine("ProductId,Title,Genre,CurrentPriceINR,MRPINR,RecordedLowestINR,DiscountPct,IsFavourite,OwnedPaidINR,HoursPlayed,AlertTargetINR")
+        sb.appendLine("ProductId,Title,Genre,CurrentPriceINR,MRPINR,LowestTrackedINR,DiscountPct,Favourite,PaidINR,HoursPlayed,AlertTargetINR")
         val favs = getFavouriteIds()
         val alerts = getAllAlerts()
         val owned = getOwnedVault()
-
-        allKnownGames.filter {
-            favs.contains(it.productId) || alerts.containsKey(it.productId) || owned.containsKey(it.productId)
-        }.forEach { g ->
-            val safeTitle = g.title.replace(",", " ")
-            val ownEntry = owned[g.productId]
+        val known = allKnownGames.associateBy { it.productId }
+        val ids = (favs + alerts.keys + owned.keys)
+        ids.forEach { id ->
+            val g = known[id]
+            val own = owned[id]
+            val title = g?.title ?: own?.title ?: alerts[id]?.title ?: id
             sb.appendLine(
-                "${g.productId},$safeTitle,${g.genre},${g.currentPriceInr},${g.mrpInr},${g.lowestEverInr},${g.discountPercent}%,${favs.contains(g.productId)},${ownEntry?.paidInr ?: ""},${ownEntry?.hoursPlayed ?: ""},${alerts[g.productId]?.targetPriceInr ?: ""}"
+                listOf(
+                    id, esc(title), esc(g?.genre ?: ""), "${g?.currentPriceInr ?: own?.currentInr ?: ""}",
+                    "${g?.mrpInr ?: own?.mrpInr ?: ""}", "${g?.lowestEverInr ?: ""}", "${g?.discountPercent ?: ""}",
+                    "${favs.contains(id)}", "${own?.paidInr ?: ""}", "${own?.hoursPlayed ?: ""}", "${alerts[id]?.targetPriceInr ?: ""}"
+                ).joinToString(",")
             )
         }
         return sb.toString()
@@ -404,7 +481,7 @@ class PriceHistoryStorage(context: Context) {
 
     fun exportWatchlistAsJson(): String {
         val root = JSONObject()
-        root.put("app", "RupeeVault X v6.0")
+        root.put("app", APP_NAME)
         root.put("favourites", JSONArray(getFavouriteIds().toList()))
         val alertsArr = JSONArray()
         getAllAlerts().values.forEach { a ->
@@ -416,36 +493,38 @@ class PriceHistoryStorage(context: Context) {
             ownedArr.put(JSONObject().apply {
                 put("id", o.productId)
                 put("title", o.title)
-                put("paidInr", o.paidInr)
+                put("paidInr", o.paidInr ?: JSONObject.NULL)
                 put("mrpInr", o.mrpInr)
                 put("hoursPlayed", o.hoursPlayed)
                 put("achievementsPct", o.achievementsPct)
             })
         }
-        root.put("ownedVault", ownedArr)
+        root.put("library", ownedArr)
+        val histObj = JSONObject()
+        trackedProductIds().forEach { id ->
+            val h = getHistory(id)
+            if (h.isNotEmpty()) {
+                histObj.put(id, JSONArray().apply { h.forEach { put(JSONArray().put(it.date.toString()).put(it.priceInr)) } })
+            }
+        }
+        root.put("priceHistory", histObj)
         return root.toString(2)
     }
 
     companion object {
-        fun computeRecommendation(
-            curr: Int,
-            mrp: Int,
-            low: Int,
-            discountPct: Int,
-            isGamePass: Boolean,
-            isLeavingSoon: Boolean,
-            isUnreleasedOrNoPrice: Boolean
-        ): Pair<String, String> {
-            return when {
-                isUnreleasedOrNoPrice || curr < 0 -> "📅" to "COMING SOON — Unreleased / Pre-Order Not Priced on MS Store IN"
-                curr == 0 -> "🆓" to "FREE TO PLAY — Official Free Game on Microsoft Store India"
-                isLeavingSoon -> "⚠️" to "LEAVING GAME PASS SOON — 20% member purchase discount active"
-                discountPct > 0 && curr <= low -> "🔥" to "BUY NOW — Lowest Recorded MS Store IN Price (₹$curr, -$discountPct%)"
-                discountPct >= 35 -> "✅" to "ACTIVE MICROSOFT STORE SALE — Save ₹${mrp - curr} (-$discountPct%)"
-                discountPct > 0 -> "🏷️" to "ON SALE — Discounted by ₹${mrp - curr} (-$discountPct%)"
-                isGamePass -> "🎮" to "INCLUDED IN GAME PASS — Or buy permanently for ₹$curr"
-                else -> "⏳" to "FULL MRP (₹$mrp) — Set a Price Alert to get notified on next Xbox sale"
-            }
+        const val APP_NAME = "Lootwise"
+        private const val MAX_HISTORY_POINTS = 400
+        val PRODUCT_ID_REGEX = Regex("^[9BC][A-Z0-9]{11}$")
+
+        fun computeVerdict(d: XboxGameDeal, atLow: Boolean): DealVerdict = when {
+            d.isUnreleasedOrNoPrice || d.currentPriceInr < 0 -> DealVerdict.COMING_SOON
+            d.currentPriceInr == 0 -> DealVerdict.FREE
+            d.isLeavingGamePassSoon -> DealVerdict.LEAVING_SOON
+            atLow -> DealVerdict.ALL_TIME_LOW
+            d.discountPercent >= 35 -> DealVerdict.BIG_SALE
+            d.discountPercent > 0 -> DealVerdict.ON_SALE
+            d.isGamePass -> DealVerdict.GAME_PASS
+            else -> DealVerdict.FULL_PRICE
         }
     }
 }

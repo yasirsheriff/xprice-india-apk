@@ -1,4 +1,4 @@
-name: Build RupeeVault X APK
+name: Build Lootwise APK
 
 on:
   push:
@@ -32,5 +32,5 @@ jobs:
       - name: Upload Ready-to-Install APK
         uses: actions/upload-artifact@v4
         with:
-          name: RupeeVault-X-Installable-APK
+          name: Lootwise-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
