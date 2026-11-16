@@ -333,22 +333,42 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ---------------------------------------------------------------------
     // Xbox sign-in
     // ---------------------------------------------------------------------
-    fun beginXboxSignIn() {
+    /** Current sign-in attempt; null when sign-in isn't in progress. */
+    var oauthSession by mutableStateOf<OAuthSession?>(null)
+        private set
+
+    /** Returns true if the sign-in screen should open. */
+    fun beginXboxSignIn(): Boolean {
+        if (!XboxLiveAuthManager.isConfigured) {
+            syncState = SyncState.Failed(
+                "Xbox sign-in isn't set up in this build yet. Add your Azure app's client ID as XBOX_CLIENT_ID in gradle.properties and rebuild."
+            )
+            return false
+        }
         tokenHandled = false
         syncState = SyncState.Idle
+        oauthSession = XboxLiveAuthManager.newSession()
+        return true
+    }
+
+    fun cancelXboxSignIn() {
+        oauthSession = null
     }
 
     fun onXboxSignInError(message: String) {
+        oauthSession = null
         syncState = SyncState.Failed(message)
     }
 
-    fun onXboxTokenCaptured(accessToken: String) {
+    fun onXboxCodeCaptured(code: String) {
         // The WebView can report the redirect more than once; only handle the first.
+        val session = oauthSession ?: return
         if (tokenHandled) return
         tokenHandled = true
+        oauthSession = null
         syncState = SyncState.Running("Signing in to Xbox Live…")
         viewModelScope.launch {
-            authManager.authenticateAndFetchLibrary(accessToken)
+            authManager.authenticateWithCode(code, session)
                 .onSuccess { data ->
                     syncState = SyncState.Running("Fetching store prices for ${data.titles.size} games…")
                     storage.saveXboxProfile(data.gamertag, data.xuid, data.gamerscore, data.avatarUrl)

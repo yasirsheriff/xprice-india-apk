@@ -34,12 +34,17 @@ data class XboxAuthSyncResult(
 
 class XboxAuthException(message: String) : Exception(message)
 
+/** One sign-in attempt: PKCE verifier + anti-forgery state. */
+class OAuthSession internal constructor(val verifier: String, val challenge: String, val state: String)
+
 /**
- * Microsoft account -> Xbox Live sign-in using the public Xbox app client.
- *  1. login.live.com OAuth (in a WebView) returns an RPS access token.
- *  2. user.auth.xboxlive.com: RPS ticket -> XBL user token
- *  3. xsts.auth.xboxlive.com: user token -> XSTS token (+ gamertag / xuid)
- *  4. profile, titlehub and userstats APIs with "XBL3.0 x=uhs;xsts".
+ * Microsoft account -> Xbox Live sign-in, using this app's own Microsoft app registration
+ * (the supported route; reusing the official Xbox app's client ID gets HTTP 403).
+ *  1. login.microsoftonline.com (in a WebView) -> authorization code (PKCE)
+ *  2. code -> Microsoft access token
+ *  3. user.auth.xboxlive.com: "d=<token>" -> XBL user token
+ *  4. xsts.auth.xboxlive.com: user token -> XSTS token (+ gamertag / xuid)
+ *  5. profile, titlehub and userstats APIs with "XBL3.0 x=uhs;xsts".
  */
 class XboxLiveAuthManager {
 
@@ -48,43 +53,107 @@ class XboxLiveAuthManager {
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    private val jsonMedia = "application/json; charset=utf-8".toMediaType()
+    private val jsonMedia = "application/json".toMediaType()
 
     companion object {
-        const val REDIRECT_URI = "https://login.live.com/oauth20_desktop.srf"
-        const val MS_OAUTH_AUTHORIZE_URL =
-            "https://login.live.com/oauth20_authorize.srf" +
-                "?client_id=0000000048093EE3" +
-                "&redirect_uri=$REDIRECT_URI" +
-                "&response_type=token" +
-                "&display=touch" +
-                "&scope=service::user.auth.xboxlive.com::MBI_SSL" +
-                "&locale=en"
+        /** Set XBOX_CLIENT_ID in gradle.properties (Azure app registration → Application (client) ID). */
+        val CLIENT_ID: String = `in`.xprice.tracker.BuildConfig.XBOX_CLIENT_ID.trim()
+        val isConfigured: Boolean get() = CLIENT_ID.isNotEmpty()
+
+        const val REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+        private const val AUTHORITY = "https://login.microsoftonline.com/consumers/oauth2/v2.0"
+        private const val SCOPES = "XboxLive.signin offline_access"
 
         private val STORE_ID_REGEX = Regex("^[9BC][A-Z0-9]{11}$")
 
-        /**
-         * Extracts the access token (or an error) from the OAuth redirect URL.
-         * The token comes back in the URL fragment: ...oauth20_desktop.srf#access_token=...&token_type=bearer...
-         */
-        fun parseRedirect(url: String): Pair<String?, String?> {
+        fun newSession(): OAuthSession {
+            val rnd = java.security.SecureRandom()
+            fun b64(bytes: ByteArray) = android.util.Base64.encodeToString(
+                bytes, android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP
+            )
+            val verifier = b64(ByteArray(48).also { rnd.nextBytes(it) })
+            val challenge = b64(java.security.MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.US_ASCII)))
+            val state = b64(ByteArray(16).also { rnd.nextBytes(it) })
+            return OAuthSession(verifier, challenge, state)
+        }
+
+        fun authorizeUrl(session: OAuthSession): String {
+            fun enc(s: String) = java.net.URLEncoder.encode(s, "UTF-8")
+            return "$AUTHORITY/authorize?client_id=${enc(CLIENT_ID)}" +
+                "&response_type=code" +
+                "&redirect_uri=${enc(REDIRECT_URI)}" +
+                "&response_mode=query" +
+                "&scope=${enc(SCOPES)}" +
+                "&code_challenge=${session.challenge}&code_challenge_method=S256" +
+                "&state=${enc(session.state)}" +
+                "&prompt=select_account"
+        }
+
+        /** Returns (authorization code, error message) when [url] is our redirect; (null, null) otherwise. */
+        fun parseRedirect(url: String, session: OAuthSession): Pair<String?, String?> {
             if (!url.startsWith(REDIRECT_URI)) return null to null
-            val params = (url.substringAfter('#', "") + "&" + url.substringAfter('?', "").substringBefore('#'))
+            val params = (url.substringAfter('?', "").substringBefore('#') + "&" + url.substringAfter('#', ""))
                 .split('&')
                 .mapNotNull { kv ->
                     val idx = kv.indexOf('=')
                     if (idx <= 0) null else kv.substring(0, idx) to java.net.URLDecoder.decode(kv.substring(idx + 1), "UTF-8")
                 }
                 .toMap()
-            val token = params["access_token"]?.takeIf { it.isNotBlank() }
-            val error = params["error_description"] ?: params["error"]
-            return token to error
+            val error = params["error"]
+            if (error != null) {
+                return null to when (error) {
+                    "access_denied" -> "Sign-in was cancelled."
+                    else -> "Microsoft sign-in error: ${params["error_description"]?.lineSequence()?.firstOrNull() ?: error}"
+                }
+            }
+            if (params["state"] != session.state) return null to "Sign-in response didn't match. Please try again."
+            val code = params["code"]?.takeIf { it.isNotBlank() } ?: return null to "Microsoft didn't return a sign-in code."
+            return code to null
         }
     }
 
-    suspend fun authenticateAndFetchLibrary(msAccessToken: String): Result<XboxAuthSyncResult> = withContext(Dispatchers.IO) {
+    suspend fun authenticateWithCode(code: String, session: OAuthSession): Result<XboxAuthSyncResult> = withContext(Dispatchers.IO) {
         try {
-            val (userToken, _) = requestUserToken(msAccessToken)
+            val msToken = exchangeCode(code, session)
+            fetchLibrary(msToken)
+        } catch (e: XboxAuthException) {
+            Result.failure(e)
+        } catch (e: java.net.UnknownHostException) {
+            Result.failure(XboxAuthException("No internet connection. Connect and try again."))
+        } catch (e: Exception) {
+            Result.failure(XboxAuthException("Microsoft sign-in failed: ${e.message ?: e.javaClass.simpleName}"))
+        }
+    }
+
+    private fun exchangeCode(code: String, session: OAuthSession): String {
+        val form = okhttp3.FormBody.Builder()
+            .add("client_id", CLIENT_ID)
+            .add("grant_type", "authorization_code")
+            .add("code", code)
+            .add("redirect_uri", REDIRECT_URI)
+            .add("code_verifier", session.verifier)
+            .add("scope", SCOPES)
+            .build()
+        val req = Request.Builder().url("$AUTHORITY/token").post(form).header("Accept", "application/json").build()
+        client.newCall(req).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            val json = try { JSONObject(body) } catch (_: Exception) { JSONObject() }
+            if (resp.isSuccessful && json.has("access_token")) return json.getString("access_token")
+            val desc = json.optString("error_description").lineSequence().firstOrNull().orEmpty()
+            throw XboxAuthException(
+                when {
+                    desc.contains("AADSTS700016") -> "The Xbox client ID isn't valid or isn't enabled for personal Microsoft accounts. Check the Azure app registration."
+                    desc.contains("AADSTS50011") -> "Redirect URI mismatch. Add $REDIRECT_URI as a Mobile/desktop redirect URI in the Azure app registration."
+                    desc.contains("AADSTS7000218") -> "Enable \"Allow public client flows\" in the Azure app registration (Authentication tab)."
+                    else -> "Microsoft token exchange failed (HTTP ${resp.code}${if (desc.isNotBlank()) ": $desc" else ""})."
+                }
+            )
+        }
+    }
+
+    private suspend fun fetchLibrary(msAccessToken: String): Result<XboxAuthSyncResult> = withContext(Dispatchers.IO) {
+        try {
+            val userToken = requestUserToken(msAccessToken)
             val xsts = requestXsts(userToken)
             val xui = xsts.getJSONObject("DisplayClaims").getJSONArray("xui").getJSONObject(0)
             val uhs = xui.getString("uhs")
@@ -136,36 +205,28 @@ class XboxLiveAuthManager {
         return client.newCall(req).execute()
     }
 
-    /**
-     * The RPS ticket prefix depends on how the token was issued ("t=" for MBI_SSL live tokens,
-     * "d=" for MSAL tokens, none for compact tickets). Try each so one bad guess isn't fatal.
-     */
-    private fun requestUserToken(accessToken: String): Pair<String, String> {
-        val candidates = if (accessToken.startsWith("t=") || accessToken.startsWith("d=")) {
-            listOf(accessToken)
-        } else {
-            listOf("t=$accessToken", accessToken, "d=$accessToken")
+    /** Microsoft identity platform tokens use the "d=" RPS ticket prefix. */
+    private fun requestUserToken(accessToken: String): String {
+        val payload = JSONObject()
+            .put("Properties", JSONObject()
+                .put("AuthMethod", "RPS")
+                .put("SiteName", "user.auth.xboxlive.com")
+                .put("RpsTicket", "d=$accessToken"))
+            .put("RelyingParty", "http://auth.xboxlive.com")
+            .put("TokenType", "JWT")
+        postJson("https://user.auth.xboxlive.com/user/authenticate", payload, "1").use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (resp.isSuccessful && body.isNotBlank()) return JSONObject(body).getString("Token")
+            val detail = listOfNotNull(
+                resp.header("WWW-Authenticate")?.take(120),
+                body.take(160).takeIf { it.isNotBlank() }
+            ).joinToString(" · ")
+            throw XboxAuthException(
+                "Xbox Live rejected the Microsoft token (HTTP ${resp.code})." +
+                    (if (detail.isNotBlank()) " Details: $detail" else "") +
+                    " Make sure the Azure app uses \"Personal Microsoft accounts\" and the XboxLive.signin scope."
+            )
         }
-        var lastCode = 0
-        for (ticket in candidates) {
-            val payload = JSONObject()
-                .put("Properties", JSONObject()
-                    .put("AuthMethod", "RPS")
-                    .put("SiteName", "user.auth.xboxlive.com")
-                    .put("RpsTicket", ticket))
-                .put("RelyingParty", "http://auth.xboxlive.com")
-                .put("TokenType", "JWT")
-            postJson("https://user.auth.xboxlive.com/user/authenticate", payload, "1").use { resp ->
-                val body = resp.body?.string().orEmpty()
-                if (resp.isSuccessful && body.isNotBlank()) {
-                    val json = JSONObject(body)
-                    val uhs = json.getJSONObject("DisplayClaims").getJSONArray("xui").getJSONObject(0).getString("uhs")
-                    return json.getString("Token") to uhs
-                }
-                lastCode = resp.code
-            }
-        }
-        throw XboxAuthException("Microsoft rejected the sign-in (HTTP $lastCode). Close this and sign in again.")
     }
 
     private fun requestXsts(userToken: String): JSONObject {

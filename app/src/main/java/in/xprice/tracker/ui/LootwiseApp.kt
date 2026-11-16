@@ -34,6 +34,7 @@ import `in`.xprice.tracker.data.PriceHistoryStorage
 import `in`.xprice.tracker.data.ViewLayoutMode
 import `in`.xprice.tracker.data.XboxGameDeal
 import `in`.xprice.tracker.data.XboxWireArticle
+import `in`.xprice.tracker.data.XboxLiveAuthManager
 import `in`.xprice.tracker.ui.components.EmptyState
 import `in`.xprice.tracker.ui.components.ShimmerFeed
 import `in`.xprice.tracker.ui.screens.*
@@ -96,7 +97,7 @@ fun LootwiseApp(vm: MainViewModel = viewModel()) {
                     profile = vm.profile,
                     library = vm.library,
                     syncState = vm.syncState,
-                    onSignIn = { vm.beginXboxSignIn(); showSignIn = true },
+                    onSignIn = { if (vm.beginXboxSignIn()) showSignIn = true },
                     onSignOut = vm::signOutXbox,
                     onDismissError = vm::dismissSyncError,
                     onExportCsv = { vm.storage.exportWatchlistAsCsv(vm.allKnownGames()) },
@@ -163,10 +164,13 @@ fun LootwiseApp(vm: MainViewModel = viewModel()) {
     if (showCompare && vm.compareSelection.size == 2) {
         CompareDialog(vm.compareSelection[0], vm.compareSelection[1]) { showCompare = false }
     }
-    if (showSignIn) {
+    val session = vm.oauthSession
+    if (showSignIn && session != null) {
         XboxSignInDialog(
-            onDismiss = { showSignIn = false },
-            onTokenCaptured = { showSignIn = false; vm.onXboxTokenCaptured(it) },
+            authorizeUrl = XboxLiveAuthManager.authorizeUrl(session),
+            parseRedirect = { XboxLiveAuthManager.parseRedirect(it, session) },
+            onDismiss = { showSignIn = false; vm.cancelXboxSignIn() },
+            onCodeCaptured = { showSignIn = false; vm.onXboxCodeCaptured(it) },
             onError = { showSignIn = false; vm.onXboxSignInError(it) }
         )
     }

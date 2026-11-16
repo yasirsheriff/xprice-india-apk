@@ -14,10 +14,12 @@ android {
         targetSdk = 35
         versionCode = 14
         versionName = "7.0.0"
+        buildConfigField("String", "XBOX_CLIENT_ID", "\"${(project.findProperty("XBOX_CLIENT_ID") as String?).orEmpty()}\"")
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {

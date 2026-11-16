@@ -31,7 +31,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import `in`.xprice.tracker.data.OwnedVaultEntry
-import `in`.xprice.tracker.data.XboxLiveAuthManager
 import `in`.xprice.tracker.data.XboxPlayerProfile
 import `in`.xprice.tracker.data.formatInr
 import `in`.xprice.tracker.ui.SyncState
@@ -296,8 +295,10 @@ private fun relativeTime(ms: Long): String {
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun XboxSignInDialog(
+    authorizeUrl: String,
+    parseRedirect: (String) -> Pair<String?, String?>,
     onDismiss: () -> Unit,
-    onTokenCaptured: (String) -> Unit,
+    onCodeCaptured: (String) -> Unit,
     onError: (String) -> Unit
 ) {
     var progress by remember { mutableIntStateOf(0) }
@@ -313,7 +314,7 @@ fun XboxSignInDialog(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Lock, null, tint = Lw.Green, modifier = Modifier.size(11.dp))
                         Spacer(Modifier.width(3.dp))
-                        Text("login.live.com", color = Lw.TextSecondary, fontSize = 11.sp)
+                        Text("login.microsoftonline.com", color = Lw.TextSecondary, fontSize = 11.sp)
                     }
                 }
             }
@@ -332,14 +333,13 @@ fun XboxSignInDialog(
 
                         fun inspect(url: String?): Boolean {
                             if (handled || url == null) return false
-                            val (token, error) = XboxLiveAuthManager.parseRedirect(url)
-                            if (token == null && error == null) return false
+                            val (code, error) = parseRedirect(url)
+                            if (code == null && error == null) return false
                             handled = true
                             stopLoading()
                             // Clear session so the next sign-in can pick a different account.
                             CookieManager.getInstance().removeAllCookies(null)
-                            if (token != null) onTokenCaptured(token)
-                            else onError(if (error == "access_denied") "Sign-in was cancelled." else "Microsoft sign-in error: $error")
+                            if (code != null) onCodeCaptured(code) else onError(error ?: "Sign-in failed.")
                             return true
                         }
 
@@ -359,7 +359,7 @@ fun XboxSignInDialog(
                                 super.doUpdateVisitedHistory(view, url, isReload)
                             }
                         }
-                        loadUrl(XboxLiveAuthManager.MS_OAUTH_AUTHORIZE_URL)
+                        loadUrl(authorizeUrl)
                     }
                 },
                 onRelease = { it.stopLoading(); it.destroy() }
