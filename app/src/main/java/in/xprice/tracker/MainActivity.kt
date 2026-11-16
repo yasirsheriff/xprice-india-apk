@@ -114,7 +114,6 @@ fun RupeeVaultMainScreen() {
     val storage = remember { PriceHistoryStorage(context) }
     val scope = rememberCoroutineScope()
 
-    // 0 = All Games | 1 = New Launches | 2 = Hot Deals | 3 = Game Pass | 4 = Xbox Wire News
     var activeTab by remember { mutableIntStateOf(0) }
 
     var allGamesList by remember { mutableStateOf(repository.getInstantCache("cache_all_games")) }
@@ -128,7 +127,6 @@ fun RupeeVaultMainScreen() {
     var showAboutDialog by remember { mutableStateOf(false) }
     var showVaultBudgetSheet by remember { mutableStateOf(false) }
 
-    // 2-Game Side-by-Side Comparator State
     var compareSelection by remember { mutableStateOf<List<XboxGameDeal>>(emptyList()) }
     var showCompareDialog by remember { mutableStateOf(false) }
 
@@ -290,7 +288,6 @@ fun RupeeVaultMainScreen() {
                     }
                 },
                 actions = {
-                    // Owned Vault, Budget Tracker & CSV/JSON Backup Export Button
                     IconButton(onClick = { showVaultBudgetSheet = true }) {
                         Icon(Icons.Default.AccountBalanceWallet, contentDescription = "My Vault & Backup", tint = Color(0xFF10B981))
                     }
@@ -519,7 +516,6 @@ fun RupeeVaultMainScreen() {
             }
         }
 
-        // 2-Game Side-by-Side VS Comparator Dialog
         if (showCompareDialog && compareSelection.size == 2) {
             TwoGameCompareDialog(
                 gameA = compareSelection[0],
@@ -531,7 +527,6 @@ fun RupeeVaultMainScreen() {
             )
         }
 
-        // Owned Vault, Gaming Budget Tracker & Export/Backup Sheet
         if (showVaultBudgetSheet) {
             ModalBottomSheet(
                 onDismissRequest = { showVaultBudgetSheet = false },
@@ -544,7 +539,6 @@ fun RupeeVaultMainScreen() {
             }
         }
 
-        // About Developer Dialog
         if (showAboutDialog) {
             AlertDialog(
                 onDismissRequest = { showAboutDialog = false },
@@ -577,7 +571,6 @@ fun RupeeVaultMainScreen() {
             )
         }
 
-        // News Reader Sheet with Instant Store Price Lookup
         selectedArticle?.let { article ->
             ModalBottomSheet(
                 onDismissRequest = { selectedArticle = null },
@@ -594,7 +587,6 @@ fun RupeeVaultMainScreen() {
             }
         }
 
-        // Game Detail, Trailer, Editions, Bank Cashback & Price Chart Sheet
         selectedGame?.let { game ->
             ModalBottomSheet(
                 onDismissRequest = { selectedGame = null },
@@ -637,9 +629,6 @@ fun RupeeVaultMainScreen() {
     }
 }
 
-// =========================================================================
-// 2-GAME SIDE-BY-SIDE VS COMPARATOR DIALOG
-// =========================================================================
 @Composable
 fun TwoGameCompareDialog(gameA: XboxGameDeal, gameB: XboxGameDeal, onDismiss: () -> Unit) {
     AlertDialog(
@@ -681,9 +670,6 @@ fun CompareMetricRow(label: String, valA: String, valB: String) {
     }
 }
 
-// =========================================================================
-// OWNED VAULT, MONTHLY BUDGET & CSV/JSON BACKUP EXPORT SHEET
-// =========================================================================
 @Composable
 fun VaultBudgetAndExportSheet(storage: PriceHistoryStorage, allKnownGames: List<XboxGameDeal>) {
     val context = LocalContext.current
@@ -761,9 +747,6 @@ fun VaultBudgetAndExportSheet(storage: PriceHistoryStorage, allKnownGames: List<
     }
 }
 
-// =========================================================================
-// XBOX WIRE NEWS CARD & IN-APP READER WITH INSTANT STORE LOOKUP
-// =========================================================================
 @Composable
 fun XboxNewsCard(article: XboxWireArticle, onClick: () -> Unit) {
     Card(
@@ -819,7 +802,6 @@ fun NewsArticleReaderSheet(article: XboxWireArticle, onCheckStorePrice: (String)
         Spacer(modifier = Modifier.height(10.dp))
         Text(article.title, fontSize = 20.sp, fontWeight = FontWeight.Black, color = Color.White)
 
-        // Instant News-to-Store Price Lookup Button
         if (article.extractedGameQuery.length >= 3) {
             Spacer(modifier = Modifier.height(10.dp))
             Button(
@@ -862,9 +844,6 @@ fun NewsArticleReaderSheet(article: XboxWireArticle, onCheckStorePrice: (String)
     }
 }
 
-// =========================================================================
-// SHIMMER LOADING & GAME CARDS (WITH COUNTDOWN, LEAVING SOON & VS BUTTON)
-// =========================================================================
 @Composable
 fun ShimmerLoadingFeed() {
     val transition = rememberInfiniteTransition(label = "shimmer")
@@ -1115,9 +1094,6 @@ fun BadgePill(text: String, bgColor: Color, textColor: Color) {
     }
 }
 
-// =========================================================================
-// DETAIL SHEET: CASHBACK CALCULATOR + MULTI-EDITION SKU + SHARE + VAULT
-// =========================================================================
 @Composable
 fun GameDetailAnalysisSheet(
     game: XboxGameDeal,
@@ -1132,7 +1108,6 @@ fun GameDetailAnalysisSheet(
     var targetPrice by remember { mutableIntStateOf(game.alertTargetInr ?: game.lowestEverInr.coerceAtLeast(100)) }
     var lightboxIndex by remember { mutableStateOf<Int?>(null) }
 
-    // India Bank / Gift Card Cashback Discount % (0%, 5%, 8%, 10%)
     var selectedCashbackPct by remember { mutableIntStateOf(0) }
     val effectiveInr = ((game.currentPriceInr * (100 - selectedCashbackPct)) / 100.0).roundToInt()
 
@@ -1198,17 +1173,14 @@ fun GameDetailAnalysisSheet(
                 Text(game.title, fontSize = 20.sp, fontWeight = FontWeight.Black)
                 Text("${game.publisher} • ${game.genre} • ${game.releaseDate}", color = Color.Gray, fontSize = 12.sp)
             }
-            // One-Tap WhatsApp / Telegram Deal Share Button
             IconButton(onClick = {
-                val shareMsg = "🎮 *${game.title}* on Xbox India Store!
-" +
-                    "💰 Live Price: *₹${game.currentPriceInr}* (MRP ₹${game.mrpInr}, -${game.discountPercent}%)
-" +
-                    "📉 All-Time Low: ₹${game.lowestEverInr}
-" +
-                    "${game.recommendationEmoji} ${game.dealRating}
-" +
-                    "🔗 ${game.storeUrl}"
+                val shareMsg = buildString {
+                    appendLine("🎮 *${game.title}* on Xbox India Store!")
+                    appendLine("💰 Live Price: *₹${game.currentPriceInr}* (MRP ₹${game.mrpInr}, -${game.discountPercent}%)")
+                    appendLine("📉 All-Time Low: ₹${game.lowestEverInr}")
+                    appendLine("${game.recommendationEmoji} ${game.dealRating}")
+                    append("🔗 ${game.storeUrl}")
+                }
                 val sendIntent = Intent(Intent.ACTION_SEND).apply {
                     type = "text/plain"
                     putExtra(Intent.EXTRA_TEXT, shareMsg)
@@ -1262,7 +1234,6 @@ fun GameDetailAnalysisSheet(
             }
         }
 
-        // India Bank & Gift Card Cashback Calculator
         if (game.currentPriceInr > 0) {
             Spacer(modifier = Modifier.height(14.dp))
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
@@ -1285,7 +1256,6 @@ fun GameDetailAnalysisSheet(
             }
         }
 
-        // Multi-Edition & Bundle SKU Comparator
         if (game.editions.isNotEmpty()) {
             Spacer(modifier = Modifier.height(12.dp))
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
@@ -1308,7 +1278,6 @@ fun GameDetailAnalysisSheet(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Ratings, Platforms & Game Intel
         Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("📊 Ratings, Platforms & Game Intel", fontWeight = FontWeight.ExtraBold, fontSize = 14.sp, color = Color.White)
@@ -1326,7 +1295,6 @@ fun GameDetailAnalysisSheet(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Smart Buy Verdict
         Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1D2432)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
             Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(game.recommendationEmoji, fontSize = 28.sp)
@@ -1387,7 +1355,6 @@ fun GameDetailAnalysisSheet(
             }
         }
 
-        // Owned Vault Toggle Button
         Spacer(modifier = Modifier.height(12.dp))
         OutlinedButton(
             onClick = {

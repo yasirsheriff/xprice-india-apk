@@ -20,7 +20,6 @@ data class OwnedVaultEntry(
 class PriceHistoryStorage(context: Context) {
     private val prefs = context.getSharedPreferences("rupeevault_x_v4_ledger", Context.MODE_PRIVATE)
 
-    // --- Favourites ---
     fun isFavourite(productId: String): Boolean = getFavouriteIds().contains(productId)
 
     fun toggleFavourite(productId: String): Boolean {
@@ -38,7 +37,6 @@ class PriceHistoryStorage(context: Context) {
 
     fun getFavouriteIds(): Set<String> = prefs.getStringSet("favourite_ids", emptySet()) ?: emptySet()
 
-    // --- Owned Vault & Gaming Budget Tracker ---
     fun markGameOwned(productId: String, title: String, paidInr: Int, mrpInr: Int) {
         val vault = getOwnedVault().toMutableMap()
         vault[productId] = OwnedVaultEntry(productId, title, paidInr, maxOf(paidInr, mrpInr))
@@ -78,7 +76,6 @@ class PriceHistoryStorage(context: Context) {
         prefs.edit().putString("owned_vault_entries", arr.toString()).apply()
     }
 
-    // --- Offline Catalog Cache ---
     fun saveCachedDeals(deals: List<XboxGameDeal>, cacheKey: String) {
         val arr = JSONArray()
         deals.take(80).forEach { d ->
@@ -295,7 +292,6 @@ class PriceHistoryStorage(context: Context) {
         prefs.edit().putString("active_alerts", arr.toString()).apply()
     }
 
-    // --- Export & Backup Watchlist / Ledger (CSV & JSON) ---
     fun exportWatchlistAsCsv(allKnownGames: List<XboxGameDeal>): String {
         val sb = StringBuilder()
         sb.appendLine("ProductId,Title,Genre,CurrentPriceINR,MRPINR,AllTimeLowINR,DiscountPct,IsFavourite,OwnedPaidINR,AlertTargetINR")

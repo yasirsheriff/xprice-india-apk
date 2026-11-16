@@ -91,7 +91,7 @@ class XboxStoreRepository(context: Context) {
     companion object {
         private const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        private val PRODUCT_ID_REGEX = Regex("\b[9BC][A-Z0-9]{11}\b")
+        private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
     }
 
     private val trackedCatalog = listOf(
@@ -224,7 +224,6 @@ class XboxStoreRepository(context: Context) {
         }
     }
 
-    // Fetch Game Pass India Catalog + Leaving Game Pass Soon SIGL Radar
     suspend fun fetchGamePassIndiaCatalog(): Result<List<XboxGameDeal>> = withContext(Dispatchers.IO) {
         try {
             val leavingSoonIds = LinkedHashSet<String>()
@@ -453,7 +452,6 @@ class XboxStoreRepository(context: Context) {
 
             val criticScore = ((parsedRating / 5.0) * 92.0).roundToInt().coerceIn(68, 98)
 
-            // Extract Multi-Edition SKUs, Live INR Prices & Sale Countdown Timer
             var foundListPrice = -1.0
             var foundMsrp = -1.0
             var countdownStr = ""
