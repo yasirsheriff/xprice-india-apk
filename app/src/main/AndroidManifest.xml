@@ -19,7 +19,6 @@
             </intent-filter>
         </activity>
 
-        <!-- Home Screen Price-Drop Glance Widget -->
         <receiver
             android:name=".widget.RupeeVaultWidgetReceiver"
             android:exported="true"

@@ -32,11 +32,11 @@ class XboxNewsRepository(context: Context) {
         private const val XBOX_WIRE_RSS_URL = "https://news.xbox.com/en-us/feed/"
         private const val USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        private val IMG_SRC_REGEX = Regex("<img[^>]+src=["']([^"']+)["']", RegexOption.IGNORE_CASE)
+        private val IMG_SRC_REGEX = Regex("<img[^>]+src=[\\"']([^\\"']+)[\\"']", RegexOption.IGNORE_CASE)
 
         fun extractGameSearchKeyword(headline: String): String {
             val cleaned = headline
-                .replace(Regex("^(Available Now|Coming Soon|Next Week on Xbox|Free Play Days|Announcing|Inside Xbox|Review)[:\-–]\s*", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^(Available Now|Coming Soon|Next Week on Xbox|Free Play Days|Announcing|Inside Xbox|Review)[:\\-–]\\s*", RegexOption.IGNORE_CASE), "")
                 .substringBefore(":")
                 .substringBefore("–")
                 .substringBefore(" - ")
@@ -113,7 +113,7 @@ class XboxNewsRepository(context: Context) {
     private fun stripHtml(rawHtml: String): String {
         if (rawHtml.isBlank()) return ""
         val plain = Html.fromHtml(rawHtml, Html.FROM_HTML_MODE_COMPACT).toString()
-        return plain.replace(Regex("\s+"), " ").trim()
+        return plain.replace(Regex("\\s+"), " ").trim()
     }
 
     private fun parseXboxWireRss(xmlStr: String): List<XboxWireArticle> {
