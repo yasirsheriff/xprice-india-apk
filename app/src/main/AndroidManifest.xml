@@ -5,8 +5,9 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@drawable/ic_rupeevault_logo"
-        android:label="RupeeVault X"
+        android:roundIcon="@drawable/ic_lootwise_logo"
+        android:icon="@drawable/ic_lootwise_logo"
+        android:label="Lootwise"
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
@@ -22,7 +23,7 @@
         <receiver
             android:name=".widget.RupeeVaultWidgetReceiver"
             android:exported="true"
-            android:label="RupeeVault X Live Deals">
+            android:label="Lootwise deals">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>

@@ -19,18 +19,19 @@ import androidx.glance.text.Text
 import androidx.glance.text.TextStyle
 import androidx.glance.unit.ColorProvider
 import `in`.xprice.tracker.MainActivity
+import `in`.xprice.tracker.data.CatalogKey
 import `in`.xprice.tracker.data.PriceHistoryStorage
+import `in`.xprice.tracker.data.formatInr
 
+// Class names kept from earlier versions so widgets already on home screens keep working.
 class RupeeVaultWidget : GlanceAppWidget() {
     override suspend fun provideGlance(context: Context, id: GlanceId) {
         val storage = PriceHistoryStorage(context)
         val favIds = storage.getFavouriteIds()
         val alerts = storage.getAllAlerts()
-        val allCached = (
-            storage.loadCachedDeals("cache_all_games") +
-            storage.loadCachedDeals("cache_hot_deals") +
-            storage.loadCachedDeals("cache_gamepass")
-        ).distinctBy { it.productId }
+        val allCached = listOf(CatalogKey.ALL, CatalogKey.DEALS, CatalogKey.GAME_PASS)
+            .flatMap { storage.loadCachedDeals(it.cacheKey) }
+            .distinctBy { it.productId }
 
         val widgetGames = allCached.filter { favIds.contains(it.productId) || alerts.containsKey(it.productId) }
             .ifEmpty { allCached.filter { it.discountPercent > 0 }.ifEmpty { allCached } }
@@ -51,7 +52,7 @@ class RupeeVaultWidget : GlanceAppWidget() {
                 .clickable(actionStartActivity<MainActivity>())
         ) {
             Text(
-                text = "RupeeVault X • Live Microsoft IN ₹",
+                text = "Lootwise · Xbox India prices",
                 style = TextStyle(
                     color = ColorProvider(Color(0xFF10B981)),
                     fontWeight = FontWeight.Bold,
@@ -61,7 +62,7 @@ class RupeeVaultWidget : GlanceAppWidget() {
             Spacer(modifier = GlanceModifier.height(6.dp))
             if (items.isEmpty()) {
                 Text(
-                    text = "Tap to sync live Xbox India prices",
+                    text = "Open Lootwise to load prices",
                     style = TextStyle(color = ColorProvider(Color.LightGray), fontSize = 12.sp)
                 )
             } else {
@@ -80,8 +81,8 @@ class RupeeVaultWidget : GlanceAppWidget() {
                         val tag = when {
                             priceInr < 0 -> "SOON"
                             priceInr == 0 -> "FREE"
-                            discountPct > 0 -> "₹$priceInr (-$discountPct%)"
-                            else -> "₹$priceInr"
+                            discountPct > 0 -> "${formatInr(priceInr)} (-$discountPct%)"
+                            else -> formatInr(priceInr)
                         }
                         Text(
                             text = tag,
