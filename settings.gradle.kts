@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "XPriceIndia"
+rootProject.name = "RupeeVaultX"
 include(":app")
