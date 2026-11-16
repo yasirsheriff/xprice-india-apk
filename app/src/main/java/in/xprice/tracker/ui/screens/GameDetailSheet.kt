@@ -191,8 +191,8 @@ fun GameDetailSheet(
             if (changes == 0) {
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Microsoft doesn't publish past prices, so history builds up on your phone from the day Lootwise first sees a game. " +
-                        "Favourite this game or set an alert and it's checked twice a day, even when the app is closed.",
+                    "No price changes recorded yet. History comes from Lootwise's daily check of every Xbox India game, " +
+                        "plus Microsoft's own record of recent sales, so the chart fills in as prices change.",
                     color = Lw.TextMuted, fontSize = 11.sp, lineHeight = 15.sp
                 )
             }

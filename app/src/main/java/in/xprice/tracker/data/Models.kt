@@ -61,6 +61,8 @@ data class XboxGameDeal(
     val discountPercent: Int,
     val isGamePass: Boolean,
     val storeUrl: String,
+    /** Dated points derived from Microsoft's HistoricalBestAvailabilities (not cached). */
+    val saleWindowPoints: List<PricePoint> = emptyList(),
 
     // --- Local user data & tracked history (filled by PriceHistoryStorage.enrich) ---
     val isFavourite: Boolean = false,

@@ -32,9 +32,14 @@ class XboxStoreRepository(context: Context) {
         private const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         private val PRODUCT_ID_REGEX = Regex("\\b[9BC][A-Z0-9]{11}\\b")
-        private const val RECO = "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists"
-        private const val RECO_PARAMS = "Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox"
-        private const val MAX_IDS_PER_FEED = 90
+        private const val MAX_IDS_PER_FEED = 100
+
+        /**
+         * Shared daily price data written by tools/price-collector (GitHub Actions)
+         * to the `price-data` branch of this public repo.
+         */
+        const val SHARED_DATA_BASE = "https://raw.githubusercontent.com/yasirsheriff/xprice-india-apk/price-data"
+        private const val GAMEPASS_SIGL = "https://catalog.gamepass.com/sigls/v2?language=en-in&market=IN&id="
 
         private val FREE_TO_PLAY_HINTS = listOf(
             "Fortnite", "Warzone", "Apex Legends", "Roblox", "Valorant", "Overwatch", "Rocket League",
@@ -55,13 +60,12 @@ class XboxStoreRepository(context: Context) {
             }
     }
 
-    // Always included in "Explore" so the list is never empty on a cold start.
+    // Fallback for "Explore" if the shared lists can't be reached.
     private val seedProductIds = listOf(
-        "9N8VG0B7TDZ0", // Cyberpunk 2077: Ultimate Edition
         "9N2ZDN7NWQKV", // Red Dead Redemption 2
         "9P3J32CTXLRZ", // Elden Ring
         "9NKX70BBCDRN", // Forza Horizon 5
-        "BPQ955FQFPH6", // The Witcher 3: Complete Edition
+        "BPQ955FQFPH6", // Destiny 2
         "9N4RSG99KV1X"  // Grand Theft Auto V
     )
 
@@ -70,24 +74,42 @@ class XboxStoreRepository(context: Context) {
     fun lastUpdated(key: CatalogKey): Long = storage.cacheTimestamp(key.cacheKey)
 
     suspend fun fetch(key: CatalogKey, forceRefresh: Boolean): Result<List<XboxGameDeal>> = when (key) {
-        CatalogKey.ALL -> fetchFeed(
-            key, forceRefresh, includeTracked = true,
-            urls = listOf(
-                "$RECO/Computed/TopPaid?$RECO_PARAMS&count=30",
-                "$RECO/Computed/BestRated?$RECO_PARAMS&count=25",
-                "$RECO/Computed/Deal?$RECO_PARAMS&count=25",
-                "$RECO/Computed/New?$RECO_PARAMS&count=15"
-            )
-        )
-        CatalogKey.NEW -> fetchFeed(
-            key, forceRefresh, forceNewLaunch = true,
-            urls = listOf("$RECO/Computed/New?$RECO_PARAMS&count=60")
-        )
-        CatalogKey.DEALS -> fetchFeed(
-            key, forceRefresh,
-            urls = listOf("$RECO/Computed/Deal?$RECO_PARAMS&count=90")
-        )
+        CatalogKey.ALL -> fetchFeed(key, forceRefresh, includeTracked = true, urls = listOf("$SHARED_DATA_BASE/lists/top.json"))
+        CatalogKey.NEW -> fetchFeed(key, forceRefresh, forceNewLaunch = true, urls = listOf("$SHARED_DATA_BASE/lists/new.json"))
+        CatalogKey.DEALS -> fetchFeed(key, forceRefresh, urls = listOf("$SHARED_DATA_BASE/lists/deals.json"))
         CatalogKey.GAME_PASS -> fetchGamePass(forceRefresh)
+    }
+
+    /**
+     * Downloads the shared daily history for these games and merges it into local history.
+     * Skips games synced in the last 12h unless [force]. Returns how many games were updated.
+     */
+    suspend fun syncSharedHistory(productIds: Collection<String>, force: Boolean = false): Int = withContext(Dispatchers.IO) {
+        val due = productIds.filter { force || System.currentTimeMillis() - storage.remoteHistoryFetchedAt(it) > 12 * 3_600_000L }
+        if (due.isEmpty()) return@withContext 0
+        val updatedDay = httpGetText("$SHARED_DATA_BASE/meta.json")?.let {
+            try { java.time.LocalDate.parse(JSONObject(it).getString("updated")).toEpochDay() } catch (_: Exception) { null }
+        } ?: return@withContext 0
+
+        coroutineScope {
+            due.map { pid ->
+                async {
+                    val body = httpGetText("$SHARED_DATA_BASE/prices/$pid.json")
+                    storage.markRemoteHistoryFetched(pid)
+                    val arr = body?.let { try { JSONObject(it).optJSONArray("h") } catch (_: Exception) { null } } ?: return@async false
+                    val points = (0 until arr.length()).mapNotNull { i ->
+                        val pair = arr.optJSONArray(i) ?: return@mapNotNull null
+                        val day = try { java.time.LocalDate.parse(pair.getString(0)).toEpochDay() } catch (_: Exception) { return@mapNotNull null }
+                        PricePoint(day, pair.optInt(1, -1))
+                    }.filter { it.priceInr > 0 }
+                    if (points.isEmpty()) return@async false
+                    // Change points only: the last price was still valid on the collector's last run.
+                    val terminal = PricePoint(maxOf(updatedDay, points.last().epochDay), points.last().priceInr)
+                    storage.mergePoints(pid, points + terminal)
+                    true
+                }
+            }.awaitAll().count { it }
+        }
     }
 
     private fun httpGetText(url: String): String? = try {
@@ -117,15 +139,14 @@ class XboxStoreRepository(context: Context) {
         }
 
         val ids = LinkedHashSet<String>()
-        if (includeTracked) {
-            ids.addAll(storage.trackedProductIds())
-            ids.addAll(seedProductIds)
-        }
         ids.addAll(leavingIds)
-
         val bodies = coroutineScope { urls.map { async { httpGetText(it) } }.awaitAll() }
         bodies.filterNotNull().forEach { body ->
-            PRODUCT_ID_REGEX.findAll(body).forEach { if (ids.size < MAX_IDS_PER_FEED) ids.add(it.value) }
+            extractIds(body).forEach { if (ids.size < MAX_IDS_PER_FEED) ids.add(it) }
+        }
+        if (includeTracked) {
+            ids.addAll(storage.trackedProductIds())
+            if (ids.size < 20) ids.addAll(seedProductIds)
         }
 
         val games = fetchCatalogByBigIds(ids.toList(), forceGamePass, forceNewLaunch, leavingIds)
@@ -142,15 +163,28 @@ class XboxStoreRepository(context: Context) {
         }
     }
 
+    /** Shared lists are [[id, title, price, mrp, pct], ...]; anything else is scanned for product IDs. */
+    private fun extractIds(body: String): List<String> {
+        val trimmed = body.trimStart()
+        if (trimmed.startsWith("[[")) {
+            return try {
+                val arr = org.json.JSONArray(trimmed)
+                (0 until arr.length()).mapNotNull { arr.optJSONArray(it)?.optString(0)?.takeIf { id -> id.length == 12 } }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+        return PRODUCT_ID_REGEX.findAll(body).map { it.value }.toList()
+    }
+
     private suspend fun fetchGamePass(forceRefresh: Boolean): Result<List<XboxGameDeal>> = withContext(Dispatchers.IO) {
         val leaving = LinkedHashSet<String>()
-        httpGetText("https://catalog.gamepass.com/sigls/v2?id=393f05bf-e596-4ef6-9487-6d4fa0eab987&language=en-in&market=IN")
+        httpGetText("${GAMEPASS_SIGL}393f05bf-e596-4ef6-9487-6d4fa0eab987")
             ?.let { raw -> PRODUCT_ID_REGEX.findAll(raw).forEach { leaving.add(it.value) } }
         fetchFeed(
             CatalogKey.GAME_PASS, forceRefresh,
             urls = listOf(
-                "$RECO/Collection/XboxGamePass?$RECO_PARAMS&count=60",
-                "https://catalog.gamepass.com/sigls/v2?id=f6f1f99f-9b49-4ccd-b3bf-4d9767a77f5e&language=en-in&market=IN"
+                "${GAMEPASS_SIGL}f6f1f99f-9b49-4ccd-b3bf-4d9767a77f5e" // All console games
             ),
             forceGamePass = true,
             leavingIds = leaving
@@ -202,7 +236,10 @@ class XboxStoreRepository(context: Context) {
                 }
             }.awaitAll().flatten().distinctBy { it.productId }
         }
-        raw.forEach { storage.recordPrice(it.productId, it.currentPriceInr) }
+        raw.forEach {
+            storage.mergePoints(it.productId, it.saleWindowPoints)
+            storage.recordPrice(it.productId, it.currentPriceInr)
+        }
         storage.enrich(raw)
     }
 
@@ -305,6 +342,7 @@ class XboxStoreRepository(context: Context) {
             // --- Pricing: only availabilities that allow "Purchase" ---
             var lowestPaid = Double.MAX_VALUE
             var lowestPaidMsrp = -1.0
+            var lowestSku: JSONObject? = null
             var hasFreeSku = false
             var saleEnds = 0L
             var gamePass = forceGamePass
@@ -339,6 +377,7 @@ class XboxStoreRepository(context: Context) {
                             if (list < lowestPaid) {
                                 lowestPaid = list
                                 lowestPaidMsrp = msrp
+                                lowestSku = skuWrap
                                 // A sale has a near end date; regular prices end in year 9998.
                                 val end = parseIsoToEpochMs(av.optJSONObject("Conditions")?.optString("EndDate").orEmpty())
                                 saleEnds = if (pct > 0 && end > now && end - now < 60L * 24 * 3_600_000) end else 0L
@@ -382,11 +421,42 @@ class XboxStoreRepository(context: Context) {
                     mrpInr = mrp,
                     discountPercent = discount,
                     isGamePass = gamePass,
-                    storeUrl = "https://www.xbox.com/en-in/games/store/_/$prodId"
+                    storeUrl = "https://www.xbox.com/en-in/games/store/_/$prodId",
+                    saleWindowPoints = lowestSku?.let { saleWindowPoints(it) } ?: emptyList()
                 )
             )
         }
         return result
+    }
+
+    /**
+     * Microsoft returns a SKU's recent best price as HistoricalBestAvailabilities with real
+     * start/end dates. Each discounted window becomes: sale price on its start day and,
+     * if it has ended, the regular price (MSRP) again on its end day.
+     */
+    private fun saleWindowPoints(sku: JSONObject): List<PricePoint> {
+        val windows = sku.optJSONArray("HistoricalBestAvailabilities") ?: return emptyList()
+        val today = java.time.LocalDate.now()
+        fun day(iso: String): java.time.LocalDate? = try {
+            java.time.LocalDate.parse(iso.take(10)).takeIf { it.year in 2010..9000 }
+        } catch (_: Exception) { null }
+
+        val points = mutableListOf<PricePoint>()
+        for (i in 0 until windows.length()) {
+            val w = windows.optJSONObject(i) ?: continue
+            val price = w.optJSONObject("OrderManagementData")?.optJSONObject("Price") ?: continue
+            val list = price.optDouble("ListPrice", -1.0)
+            val msrp = price.optDouble("MSRP", -1.0)
+            if (list <= 0.0 || msrp <= 0.0 || list >= msrp) continue
+            val cond = w.optJSONObject("Conditions") ?: continue
+            val start = day(cond.optString("StartDate")) ?: continue
+            if (start.isAfter(today)) continue
+            points.add(PricePoint(start.toEpochDay(), list.roundToInt()))
+            day(cond.optString("EndDate"))?.takeIf { it.isBefore(today) }?.let {
+                points.add(PricePoint(it.toEpochDay(), msrp.roundToInt()))
+            }
+        }
+        return points
     }
 
     private fun normalizeGenre(raw: String): String = when {

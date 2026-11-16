@@ -20,8 +20,8 @@ import `in`.xprice.tracker.data.formatInr
 import `in`.xprice.tracker.widget.RupeeVaultWidget
 
 /**
- * Runs every ~12h. Fetches live prices for every tracked game (favourites, alerts, owned),
- * which also writes a point into each game's price history, then fires alerts.
+ * Runs every ~12h. Pulls the shared daily history for tracked games (favourites, alerts, owned),
+ * fetches their live prices (which also records today's point), then fires alerts.
  */
 class PriceAlertWorker(
     appContext: Context,
@@ -32,7 +32,9 @@ class PriceAlertWorker(
         val storage = PriceHistoryStorage(applicationContext)
         val tracked = storage.trackedProductIds()
         if (tracked.isNotEmpty()) {
-            val live = XboxStoreRepository(applicationContext).fetchCatalogByBigIds(tracked.toList())
+            val repository = XboxStoreRepository(applicationContext)
+            repository.syncSharedHistory(tracked)
+            val live = repository.fetchCatalogByBigIds(tracked.toList())
             val alerts = storage.getAllAlerts()
             live.forEach { deal ->
                 val alert = alerts[deal.productId] ?: return@forEach
