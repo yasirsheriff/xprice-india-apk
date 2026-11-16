@@ -50,19 +50,14 @@ class RupeeVaultWidget : GlanceAppWidget() {
                 .padding(12.dp)
                 .clickable(actionStartActivity<MainActivity>())
         ) {
-            Row(
-                modifier = GlanceModifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "RupeeVault X • Live Xbox IN ₹",
-                    style = TextStyle(
-                        color = ColorProvider(Color(0xFF10B981)),
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.sp
-                    )
+            Text(
+                text = "RupeeVault X • Live Xbox IN ₹",
+                style = TextStyle(
+                    color = ColorProvider(Color(0xFF10B981)),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp
                 )
-            }
+            )
             Spacer(modifier = GlanceModifier.height(6.dp))
             if (items.isEmpty()) {
                 Text(

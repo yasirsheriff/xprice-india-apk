@@ -21,9 +21,9 @@ data class GameEditionOption(
 )
 
 enum class ViewLayoutMode(val label: String) {
-    GRID("Grid"),
-    LIST("List"),
-    DETAILED("Detailed")
+    DETAILED("Detailed View"),
+    GRID("Grid View"),
+    LIST("Compact List")
 }
 
 data class XboxGameDeal(
@@ -136,9 +136,9 @@ class XboxStoreRepository(context: Context) {
             val channels = listOf(
                 "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/TopPaid?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=25",
                 "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/BestRated?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=20",
-                "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/TopFree?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=15",
                 "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/Deal?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=20",
-                "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/New?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=15"
+                "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/New?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=15",
+                "https://reco-public.rec.mp.microsoft.com/channels/Reco/V8.0/Lists/Computed/TopFree?Market=in&Language=en&ItemTypes=Game&deviceFamily=Windows.Xbox&count=10"
             )
 
             channels.forEach { url ->
@@ -451,8 +451,10 @@ class XboxStoreRepository(context: Context) {
 
             val criticScore = ((parsedRating / 5.0) * 92.0).roundToInt().coerceIn(68, 98)
 
-            var foundListPrice = -1.0
-            var foundMsrp = -1.0
+            // FIXED: Separate real Paid SKUs (msrp > 0) from 0.0 Trial/Entitlement SKUs so paid games NEVER show as FREE
+            var lowestPaidListPrice = Double.MAX_VALUE
+            var matchingPaidMsrp = -1.0
+            var hasZeroEntitlement = false
             var countdownStr = ""
             var detectedGamePass = forceGamePassFlag || (knownMeta?.isGamePass == true)
             val isLeaving = leavingIds.contains(prodId) || (knownMeta?.isLeavingSoon == true)
@@ -484,8 +486,9 @@ class XboxStoreRepository(context: Context) {
 
                         val listPrice = priceObj.optDouble("ListPrice", -1.0)
                         val msrp = priceObj.optDouble("MSRP", -1.0)
-                        if (msrp >= 0.0) {
-                            val effPrice = if (listPrice >= 0.0) listPrice else msrp
+
+                        if (msrp > 0.0) {
+                            val effPrice = if (listPrice > 0.0) listPrice else msrp
                             val pInt = effPrice.roundToInt()
                             val mInt = maxOf(pInt, msrp.roundToInt())
                             val dPct = if (mInt > pInt && mInt > 0) (((mInt - pInt).toDouble() / mInt) * 100.0).roundToInt() else 0
@@ -494,19 +497,29 @@ class XboxStoreRepository(context: Context) {
                                 editionOptions.add(GameEditionOption(rawSkuTitle, pInt, mInt, dPct))
                             }
 
-                            if (foundMsrp < 0.0 || (effPrice < foundListPrice)) {
-                                foundListPrice = effPrice
-                                foundMsrp = msrp
+                            if (effPrice < lowestPaidListPrice) {
+                                lowestPaidListPrice = effPrice
+                                matchingPaidMsrp = msrp
                             }
+                        } else if (msrp == 0.0 && listPrice == 0.0) {
+                            hasZeroEntitlement = true
                         }
                     }
                 }
             }
 
-            if (foundMsrp < 0.0 && knownMeta == null) continue
+            if (matchingPaidMsrp < 0.0 && !hasZeroEntitlement && knownMeta == null) continue
 
-            val currentInr = if (foundListPrice >= 0.0) foundListPrice.roundToInt() else (knownMeta?.fallbackMrpInr ?: 0)
-            val mrpInr = if (foundMsrp >= 0.0) foundMsrp.roundToInt() else (knownMeta?.fallbackMrpInr ?: currentInr)
+            val currentInr = when {
+                lowestPaidListPrice < Double.MAX_VALUE -> lowestPaidListPrice.roundToInt()
+                knownMeta != null -> knownMeta.lowestEverInr
+                else -> 0
+            }
+            val mrpInr = when {
+                matchingPaidMsrp > 0.0 -> matchingPaidMsrp.roundToInt()
+                knownMeta != null -> knownMeta.fallbackMrpInr
+                else -> currentInr
+            }
 
             val dynamicMeta = knownMeta?.copy(isGamePass = detectedGamePass, isNewLaunch = isNewRelease, isLeavingSoon = isLeaving) ?: BaselineMeta(
                 productId = prodId,
@@ -514,8 +527,8 @@ class XboxStoreRepository(context: Context) {
                 fallbackPublisher = livePublisher,
                 fallbackGenre = normalizedGenre,
                 fallbackRating = parsedRating,
-                fallbackMrpInr = mrpInr,
-                lowestEverInr = if (currentInr == 0) 0 else minOf(currentInr, (mrpInr * 0.50).roundToInt()),
+                fallbackMrpInr = if (mrpInr > 0) mrpInr else 2499,
+                lowestEverInr = if (currentInr > 0) minOf(currentInr, (mrpInr * 0.55).roundToInt()) else 1249,
                 isGamePass = detectedGamePass,
                 isNewLaunch = isNewRelease,
                 isLeavingSoon = isLeaving,
@@ -541,7 +554,7 @@ class XboxStoreRepository(context: Context) {
                     trailerUrl = trailerUrl,
                     currentInr = currentInr,
                     mrpInr = mrpInr,
-                    isLive = foundMsrp >= 0.0
+                    isLive = matchingPaidMsrp > 0.0
                 )
             )
         }
