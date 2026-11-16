@@ -12,8 +12,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
@@ -24,11 +26,15 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -51,7 +57,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
+import androidx.glance.appwidget.updateAll
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
@@ -60,6 +69,7 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import coil.compose.AsyncImage
 import `in`.xprice.tracker.data.*
+import `in`.xprice.tracker.widget.RupeeVaultWidget
 import `in`.xprice.tracker.worker.PriceAlertWorker
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -74,13 +84,13 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val darkPalette = darkColorScheme(
-                primary = Color(0xFF22C55E),
+                primary = Color(0xFF10B981),
                 secondary = Color(0xFFF59E0B),
-                background = Color(0xFF0D0E12),
-                surface = Color(0xFF171920)
+                background = Color(0xFF090C12),
+                surface = Color(0xFF131823)
             )
             MaterialTheme(colorScheme = darkPalette) {
-                XPriceMainScreen()
+                RupeeVaultMainScreen()
             }
         }
     }
@@ -88,7 +98,7 @@ class MainActivity : ComponentActivity() {
     private fun scheduleBackgroundPriceCheck() {
         val workRequest = PeriodicWorkRequestBuilder<PriceAlertWorker>(12, TimeUnit.HOURS).build()
         WorkManager.getInstance(applicationContext).enqueueUniquePeriodicWork(
-            "xprice_india_background_sync",
+            "rupeevault_x_background_sync",
             ExistingPeriodicWorkPolicy.KEEP,
             workRequest
         )
@@ -97,27 +107,40 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun XPriceMainScreen() {
+fun RupeeVaultMainScreen() {
     val context = LocalContext.current
     val repository = remember { XboxStoreRepository(context) }
+    val newsRepository = remember { XboxNewsRepository(context) }
     val storage = remember { PriceHistoryStorage(context) }
     val scope = rememberCoroutineScope()
 
-    // 0 = Store Deals Feed, 1 = Dedicated Xbox Game Pass India Feed
-    var activeFeedTab by remember { mutableIntStateOf(0) }
+    // 0 = All Games | 1 = New Launches | 2 = Hot Deals | 3 = Game Pass | 4 = Xbox Wire News
+    var activeTab by remember { mutableIntStateOf(0) }
 
-    var storeCatalog by remember { mutableStateOf(repository.getInstantOfflineCache()) }
-    var gamePassCatalog by remember { mutableStateOf(repository.getInstantOfflineGamePassCache()) }
+    var allGamesList by remember { mutableStateOf(repository.getInstantCache("cache_all_games")) }
+    var newLaunchesList by remember { mutableStateOf(repository.getInstantCache("cache_new_launches")) }
+    var hotDealsList by remember { mutableStateOf(repository.getInstantCache("cache_hot_deals")) }
+    var gamePassList by remember { mutableStateOf(repository.getInstantCache("cache_gamepass")) }
+    var newsArticles by remember { mutableStateOf(newsRepository.getInstantCachedNews()) }
     var searchResults by remember { mutableStateOf<List<XboxGameDeal>>(emptyList()) }
-    var isSyncing by remember { mutableStateOf(true) }
+
+    var isLoading by remember { mutableStateOf(true) }
+    var showAboutDialog by remember { mutableStateOf(false) }
+    var showVaultBudgetSheet by remember { mutableStateOf(false) }
+
+    // 2-Game Side-by-Side Comparator State
+    var compareSelection by remember { mutableStateOf<List<XboxGameDeal>>(emptyList()) }
+    var showCompareDialog by remember { mutableStateOf(false) }
 
     var searchQuery by remember { mutableStateOf("") }
-    var selectedDealFilter by remember { mutableStateOf("All Deals") }
+    var selectedDealFilter by remember { mutableStateOf("Everything") }
     var selectedGenre by remember { mutableStateOf("All Genres") }
-    var selectedRatingFilter by remember { mutableStateOf("Any ★") }
-    var selectedSort by remember { mutableStateOf("Best Discount") }
+    var selectedNewsCategory by remember { mutableStateOf("All News") }
+    var selectedSort by remember { mutableStateOf("Popular") }
     var viewMode by remember { mutableStateOf(ViewLayoutMode.DETAILED) }
+
     var selectedGame by remember { mutableStateOf<XboxGameDeal?>(null) }
+    var selectedArticle by remember { mutableStateOf<XboxWireArticle?>(null) }
 
     val notificationLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
@@ -133,65 +156,82 @@ fun XPriceMainScreen() {
         }
     }
 
-    fun syncActiveCatalog() {
-        isSyncing = true
+    fun refreshActiveTab() {
+        isLoading = true
         scope.launch {
-            if (activeFeedTab == 0) {
-                repository.fetchLiveIndiaDeals().onSuccess {
-                    storeCatalog = it
-                    isSyncing = false
-                }
-            } else {
-                repository.fetchGamePassIndiaCatalog().onSuccess {
-                    gamePassCatalog = it
-                    isSyncing = false
-                }
+            when (activeTab) {
+                0 -> repository.fetchAllXboxIndiaGames().onSuccess { allGamesList = it }
+                1 -> repository.fetchNewLaunchesIndia().onSuccess { newLaunchesList = it }
+                2 -> repository.fetchHotDealsIndia().onSuccess { hotDealsList = it }
+                3 -> repository.fetchGamePassIndiaCatalog().onSuccess { gamePassList = it }
+                4 -> newsRepository.fetchLiveXboxWireNews().onSuccess { newsArticles = it }
             }
+            isLoading = false
+            try { RupeeVaultWidget().updateAll(context) } catch (_: Exception) {}
         }
     }
 
-    // Load live feed whenever user switches between Store Deals and Game Pass India tabs
-    LaunchedEffect(activeFeedTab) {
-        syncActiveCatalog()
+    LaunchedEffect(activeTab) {
+        refreshActiveTab()
     }
 
-    // Instant Type-Ahead Search
     LaunchedEffect(searchQuery) {
+        if (activeTab == 4) return@LaunchedEffect
         val q = searchQuery.trim()
         if (q.length < 2) {
             searchResults = emptyList()
-            isSyncing = false
             return@LaunchedEffect
         }
-        isSyncing = true
+        isLoading = true
         delay(250)
         repository.searchLiveXboxIndiaCatalog(q).onSuccess {
             searchResults = it
-            isSyncing = false
+            isLoading = false
         }
     }
 
     fun toggleGameFavourite(productId: String) {
         val nowFav = storage.toggleFavourite(productId)
-        storeCatalog = storeCatalog.map { if (it.productId == productId) it.copy(isFavourite = nowFav) else it }
-        gamePassCatalog = gamePassCatalog.map { if (it.productId == productId) it.copy(isFavourite = nowFav) else it }
-        searchResults = searchResults.map { if (it.productId == productId) it.copy(isFavourite = nowFav) else it }
+        fun updateList(list: List<XboxGameDeal>) = list.map {
+            if (it.productId == productId) it.copy(isFavourite = nowFav) else it
+        }
+        allGamesList = updateList(allGamesList)
+        newLaunchesList = updateList(newLaunchesList)
+        hotDealsList = updateList(hotDealsList)
+        gamePassList = updateList(gamePassList)
+        searchResults = updateList(searchResults)
         selectedGame = selectedGame?.let { if (it.productId == productId) it.copy(isFavourite = nowFav) else it }
-        Toast.makeText(
-            context,
-            if (nowFav) "❤️ Saved to Favourites" else "Removed from Favourites",
-            Toast.LENGTH_SHORT
-        ).show()
+        scope.launch { try { RupeeVaultWidget().updateAll(context) } catch (_: Exception) {} }
+        Toast.makeText(context, if (nowFav) "❤️ Saved to Favourites" else "Removed from Favourites", Toast.LENGTH_SHORT).show()
     }
 
-    val currentTabBaseList = if (activeFeedTab == 0) storeCatalog else gamePassCatalog
-
-    val activeSourceGames = remember(currentTabBaseList, searchResults, searchQuery) {
-        val q = searchQuery.trim()
-        if (q.isEmpty()) {
-            currentTabBaseList
+    fun toggleCompareGame(game: XboxGameDeal) {
+        compareSelection = if (compareSelection.any { it.productId == game.productId }) {
+            compareSelection.filterNot { it.productId == game.productId }
+        } else if (compareSelection.size >= 2) {
+            listOf(compareSelection.last(), game)
         } else {
-            val localInstant = currentTabBaseList.filter {
+            compareSelection + game
+        }
+        if (compareSelection.size == 2) {
+            showCompareDialog = true
+        } else {
+            Toast.makeText(context, "Select 1 more game to compare VS ${game.title}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val currentTabBase = when (activeTab) {
+        1 -> newLaunchesList
+        2 -> hotDealsList
+        3 -> gamePassList
+        else -> allGamesList
+    }
+
+    val activeSourceGames = remember(currentTabBase, searchResults, searchQuery) {
+        val q = searchQuery.trim()
+        if (q.isEmpty()) currentTabBase
+        else {
+            val localInstant = currentTabBase.filter {
                 it.title.contains(q, ignoreCase = true) || it.publisher.contains(q, ignoreCase = true)
             }
             (searchResults + localInstant).distinctBy { it.productId }
@@ -199,30 +239,44 @@ fun XPriceMainScreen() {
     }
 
     val filteredAndSortedGames = remember(
-        activeSourceGames, selectedDealFilter, selectedGenre, selectedRatingFilter, selectedSort
+        activeSourceGames, selectedDealFilter, selectedGenre, selectedSort
     ) {
         activeSourceGames.filter { game ->
             val matchesDeal = when (selectedDealFilter) {
                 "❤️ Favourites" -> game.isFavourite
+                "💼 Owned" -> game.ownedPaidInr != null
+                "⚠️ Leaving Soon" -> game.isLeavingGamePassSoon
                 "🔥 All-Time Low" -> game.isAtAllTimeLow
-                "🔔 My Alerts" -> game.alertTargetInr != null
+                "🏷️ On Sale" -> game.discountPercent > 0
+                "🆓 Free Games" -> game.currentPriceInr == 0
+                "🔔 Alerts" -> game.alertTargetInr != null
                 "Under ₹1,500" -> game.currentPriceInr <= 1500
-                "On Sale Only" -> game.discountPercent > 0
                 else -> true
             }
             val matchesGenre = selectedGenre == "All Genres" || game.genre.equals(selectedGenre, true)
-            val matchesRating = when (selectedRatingFilter) {
-                "4.5★ & Up" -> game.starRating >= 4.5
-                "4.0★ & Up" -> game.starRating >= 4.0
-                else -> true
-            }
-            matchesDeal && matchesGenre && matchesRating
+            matchesDeal && matchesGenre
         }.let { list ->
             when (selectedSort) {
+                "Best Discount" -> list.sortedByDescending { it.discountPercent }
                 "Lowest ₹" -> list.sortedBy { it.currentPriceInr }
                 "Top Rated ★" -> list.sortedByDescending { it.starRating }
-                else -> list.sortedByDescending { it.discountPercent }
+                else -> list
             }
+        }
+    }
+
+    val filteredNews = remember(newsArticles, searchQuery, selectedNewsCategory) {
+        newsArticles.filter { article ->
+            val matchesSearch = searchQuery.isBlank() ||
+                article.title.contains(searchQuery, ignoreCase = true) ||
+                article.summary.contains(searchQuery, ignoreCase = true)
+            val matchesCat = when (selectedNewsCategory) {
+                "Game Pass" -> article.title.contains("Game Pass", true) || article.category.contains("Game Pass", true)
+                "New Releases" -> article.title.contains("Available", true) || article.title.contains("Next Week", true) || article.category.contains("Release", true)
+                "Free Play Days" -> article.title.contains("Free Play", true)
+                else -> true
+            }
+            matchesSearch && matchesCat
         }
     }
 
@@ -231,37 +285,31 @@ fun XPriceMainScreen() {
             TopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("XPrice ", fontWeight = FontWeight.Black, fontSize = 20.sp, color = Color(0xFF22C55E))
-                        Text("INDIA ₹ (${currentTabBaseList.size})", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color.White)
+                        Text("RupeeVault ", fontWeight = FontWeight.Black, fontSize = 19.sp, color = Color(0xFF10B981))
+                        Text("X", fontWeight = FontWeight.Black, fontSize = 19.sp, color = Color(0xFFF59E0B))
                     }
                 },
                 actions = {
-                    IconButton(onClick = { viewMode = ViewLayoutMode.GRID }) {
-                        Icon(
-                            Icons.Default.GridView,
-                            contentDescription = "Grid View",
-                            tint = if (viewMode == ViewLayoutMode.GRID) Color(0xFF22C55E) else Color.Gray
-                        )
+                    // Owned Vault, Budget Tracker & CSV/JSON Backup Export Button
+                    IconButton(onClick = { showVaultBudgetSheet = true }) {
+                        Icon(Icons.Default.AccountBalanceWallet, contentDescription = "My Vault & Backup", tint = Color(0xFF10B981))
                     }
-                    IconButton(onClick = { viewMode = ViewLayoutMode.LIST }) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.ViewList,
-                            contentDescription = "Compact List View",
-                            tint = if (viewMode == ViewLayoutMode.LIST) Color(0xFF22C55E) else Color.Gray
-                        )
+                    if (activeTab != 4) {
+                        IconButton(onClick = { viewMode = ViewLayoutMode.GRID }) {
+                            Icon(Icons.Default.GridView, contentDescription = "Grid", tint = if (viewMode == ViewLayoutMode.GRID) Color(0xFF10B981) else Color.Gray)
+                        }
+                        IconButton(onClick = { viewMode = ViewLayoutMode.LIST }) {
+                            Icon(Icons.AutoMirrored.Filled.ViewList, contentDescription = "List", tint = if (viewMode == ViewLayoutMode.LIST) Color(0xFF10B981) else Color.Gray)
+                        }
+                        IconButton(onClick = { viewMode = ViewLayoutMode.DETAILED }) {
+                            Icon(Icons.Default.ViewAgenda, contentDescription = "Detailed", tint = if (viewMode == ViewLayoutMode.DETAILED) Color(0xFF10B981) else Color.Gray)
+                        }
                     }
-                    IconButton(onClick = { viewMode = ViewLayoutMode.DETAILED }) {
-                        Icon(
-                            Icons.Default.ViewAgenda,
-                            contentDescription = "Detailed List View",
-                            tint = if (viewMode == ViewLayoutMode.DETAILED) Color(0xFF22C55E) else Color.Gray
-                        )
-                    }
-                    IconButton(onClick = { syncActiveCatalog() }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Sync Live Prices", tint = Color(0xFF22C55E))
+                    IconButton(onClick = { showAboutDialog = true }) {
+                        Icon(Icons.Default.Info, contentDescription = "About Developer", tint = Color(0xFFF59E0B))
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0D0E12))
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF090C12))
             )
         }
     ) { padding ->
@@ -271,35 +319,18 @@ fun XPriceMainScreen() {
                 .padding(padding)
                 .padding(horizontal = 14.dp)
         ) {
-            // Primary Feed Switcher: Store Deals vs Dedicated Game Pass India Catalog
-            TabRow(
-                selectedTabIndex = activeFeedTab,
-                containerColor = Color(0xFF171920),
-                contentColor = Color(0xFF22C55E),
+            ScrollableTabRow(
+                selectedTabIndex = activeTab,
+                containerColor = Color(0xFF131823),
+                contentColor = Color(0xFF10B981),
+                edgePadding = 4.dp,
                 modifier = Modifier.clip(RoundedCornerShape(12.dp))
             ) {
-                Tab(
-                    selected = activeFeedTab == 0,
-                    onClick = { activeFeedTab = 0 },
-                    text = {
-                        Text(
-                            text = "🔥 Store Deals (${storeCatalog.size})",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
-                        )
-                    }
-                )
-                Tab(
-                    selected = activeFeedTab == 1,
-                    onClick = { activeFeedTab = 1 },
-                    text = {
-                        Text(
-                            text = "🎮 Game Pass (${gamePassCatalog.size})",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
-                        )
-                    }
-                )
+                Tab(selected = activeTab == 0, onClick = { activeTab = 0 }, text = { Text("🎯 All Games (${allGamesList.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold) })
+                Tab(selected = activeTab == 1, onClick = { activeTab = 1 }, text = { Text("🆕 New Launches (${newLaunchesList.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold) })
+                Tab(selected = activeTab == 2, onClick = { activeTab = 2 }, text = { Text("🔥 Hot Deals (${hotDealsList.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold) })
+                Tab(selected = activeTab == 3, onClick = { activeTab = 3 }, text = { Text("🎮 Game Pass (${gamePassList.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold) })
+                Tab(selected = activeTab == 4, onClick = { activeTab = 4 }, text = { Text("📰 Xbox News (${newsArticles.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold) })
             }
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -309,16 +340,21 @@ fun XPriceMainScreen() {
                 onValueChange = { searchQuery = it },
                 placeholder = {
                     Text(
-                        text = if (activeFeedTab == 0) "Search all Xbox India games (Halo, Forza, FIFA)..."
-                        else "Filter or search Game Pass India titles...",
-                        fontSize = 14.sp
+                        text = if (activeTab == 4) "Search official Xbox Wire headlines..."
+                        else "Search all Xbox India games (Halo, Forza, FIFA, Indie)...",
+                        fontSize = 13.sp
                     )
                 },
-                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = Color(0xFF22C55E)) },
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = Color(0xFF10B981)) },
                 trailingIcon = {
-                    if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { searchQuery = "" }) {
-                            Icon(Icons.Default.Clear, contentDescription = "Clear")
+                    Row {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = "" }) {
+                                Icon(Icons.Default.Clear, contentDescription = "Clear")
+                            }
+                        }
+                        IconButton(onClick = { refreshActiveTab() }) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Color(0xFF10B981))
                         }
                     }
                 },
@@ -327,148 +363,155 @@ fun XPriceMainScreen() {
                 singleLine = true
             )
 
-            if (isSyncing) {
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth().height(2.dp),
-                    color = Color(0xFF22C55E),
-                    trackColor = Color.Transparent
-                )
-            } else {
-                Spacer(modifier = Modifier.height(2.dp))
-            }
-
-            // Live Type-Ahead Autocomplete Suggestions Strip
-            if (searchQuery.trim().length >= 2 && activeSourceGames.isNotEmpty()) {
+            if (activeTab == 4) {
                 Spacer(modifier = Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("Matches:", fontSize = 11.sp, color = Color(0xFF22C55E), fontWeight = FontWeight.Bold)
-                    activeSourceGames.take(8).forEach { suggestion ->
-                        SuggestionChip(
-                            onClick = { selectedGame = suggestion },
-                            label = {
-                                Text(
-                                    text = "${suggestion.title} • ₹${suggestion.currentPriceInr}",
-                                    fontSize = 11.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
+                    listOf("All News", "Game Pass", "New Releases", "Free Play Days").forEach { cat ->
+                        FilterChip(
+                            selected = selectedNewsCategory == cat,
+                            onClick = { selectedNewsCategory = cat },
+                            label = { Text(cat, fontSize = 12.sp) }
                         )
                     }
                 }
-            }
+                Spacer(modifier = Modifier.height(8.dp))
 
-            Spacer(modifier = Modifier.height(6.dp))
-
-            // Filter Row 1
-            Row(
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                listOf("All Deals", "On Sale Only", "❤️ Favourites", "🔥 All-Time Low", "🔔 My Alerts", "Under ₹1,500").forEach { filter ->
-                    FilterChip(
-                        selected = selectedDealFilter == filter,
-                        onClick = { selectedDealFilter = filter },
-                        label = { Text(filter, fontSize = 12.sp) }
-                    )
-                }
-            }
-
-            // Filter Row 2
-            Row(
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                listOf("All Genres", "Action & Adventure", "Role Playing", "Racing & Flying", "Shooter").forEach { genre ->
-                    FilterChip(
-                        selected = selectedGenre == genre,
-                        onClick = { selectedGenre = genre },
-                        label = { Text(genre, fontSize = 11.sp) }
-                    )
-                }
-                listOf("Any ★", "4.5★ & Up").forEach { r ->
-                    FilterChip(
-                        selected = selectedRatingFilter == r,
-                        onClick = { selectedRatingFilter = r },
-                        label = { Text(r, fontSize = 11.sp) }
-                    )
-                }
-                listOf("Best Discount", "Lowest ₹", "Top Rated ★").forEach { s ->
-                    FilterChip(
-                        selected = selectedSort == s,
-                        onClick = { selectedSort = s },
-                        label = { Text("Sort: $s", fontSize = 11.sp) }
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            if (filteredAndSortedGames.isEmpty() && !isSyncing) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("No games matched your current filters.", color = Color.Gray)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        TextButton(onClick = {
-                            searchQuery = ""
-                            selectedDealFilter = "All Deals"
-                            selectedGenre = "All Genres"
-                            selectedRatingFilter = "Any ★"
-                        }) {
-                            Text("Reset Search & Filters", color = Color(0xFF22C55E))
+                if (isLoading && filteredNews.isEmpty()) {
+                    ShimmerLoadingFeed()
+                } else {
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        contentPadding = PaddingValues(bottom = 24.dp)
+                    ) {
+                        items(filteredNews, key = { it.id }) { article ->
+                            XboxNewsCard(article = article, onClick = { selectedArticle = article })
                         }
                     }
                 }
             } else {
-                when (viewMode) {
-                    ViewLayoutMode.GRID -> {
-                        LazyVerticalGrid(
-                            columns = GridCells.Adaptive(minSize = 160.dp),
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            contentPadding = PaddingValues(bottom = 24.dp)
-                        ) {
-                            items(filteredAndSortedGames, key = { it.productId }) { game ->
-                                GameGridCard(
-                                    game = game,
-                                    onToggleFav = { toggleGameFavourite(game.productId) },
-                                    onClick = { selectedGame = game }
-                                )
-                            }
+                if (searchQuery.trim().length >= 2 && activeSourceGames.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Live Matches:", fontSize = 11.sp, color = Color(0xFF10B981), fontWeight = FontWeight.Bold)
+                        activeSourceGames.take(8).forEach { suggestion ->
+                            SuggestionChip(
+                                onClick = { selectedGame = suggestion },
+                                label = {
+                                    val priceTag = if (suggestion.currentPriceInr == 0) "FREE" else "₹${suggestion.currentPriceInr}"
+                                    Text("${suggestion.title} • $priceTag", fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            )
                         }
                     }
+                }
 
-                    ViewLayoutMode.LIST -> {
-                        LazyColumn(
-                            verticalArrangement = Arrangement.spacedBy(10.dp),
-                            contentPadding = PaddingValues(bottom = 24.dp)
-                        ) {
-                            items(filteredAndSortedGames, key = { it.productId }) { game ->
-                                GameCompactListCard(
-                                    game = game,
-                                    onToggleFav = { toggleGameFavourite(game.productId) },
-                                    onClick = { selectedGame = game }
-                                )
-                            }
-                        }
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf("Everything", "🏷️ On Sale", "⚠️ Leaving Soon", "❤️ Favourites", "💼 Owned", "🔥 All-Time Low", "🆓 Free Games", "🔔 Alerts", "Under ₹1,500").forEach { filter ->
+                        FilterChip(
+                            selected = selectedDealFilter == filter,
+                            onClick = { selectedDealFilter = filter },
+                            label = { Text(filter, fontSize = 11.sp) }
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf("All Genres", "Action & Adventure", "Role Playing", "Racing & Flying", "Shooter", "Sports").forEach { genre ->
+                        FilterChip(
+                            selected = selectedGenre == genre,
+                            onClick = { selectedGenre = genre },
+                            label = { Text(genre, fontSize = 11.sp) }
+                        )
+                    }
+                    listOf("Popular", "Best Discount", "Lowest ₹", "Top Rated ★").forEach { s ->
+                        FilterChip(
+                            selected = selectedSort == s,
+                            onClick = { selectedSort = s },
+                            label = { Text("Sort: $s", fontSize = 11.sp) }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (isLoading && filteredAndSortedGames.isEmpty()) {
+                    ShimmerLoadingFeed()
+                } else {
+                    if (isLoading) {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth().height(3.dp).clip(CircleShape),
+                            color = Color(0xFF10B981),
+                            trackColor = Color(0xFF1E293B)
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
                     }
 
-                    ViewLayoutMode.DETAILED -> {
-                        LazyColumn(
-                            verticalArrangement = Arrangement.spacedBy(14.dp),
-                            contentPadding = PaddingValues(bottom = 24.dp)
-                        ) {
-                            items(filteredAndSortedGames, key = { it.productId }) { game ->
-                                GameDetailedCard(
-                                    game = game,
-                                    onToggleFav = { toggleGameFavourite(game.productId) },
-                                    onClick = { selectedGame = game }
-                                )
+                    when (viewMode) {
+                        ViewLayoutMode.GRID -> {
+                            LazyVerticalGrid(
+                                columns = GridCells.Adaptive(minSize = 160.dp),
+                                verticalArrangement = Arrangement.spacedBy(12.dp),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                contentPadding = PaddingValues(bottom = 24.dp)
+                            ) {
+                                items(filteredAndSortedGames, key = { it.productId }) { game ->
+                                    GameGridCard(
+                                        game = game,
+                                        isSelectedForCompare = compareSelection.any { it.productId == game.productId },
+                                        onToggleFav = { toggleGameFavourite(game.productId) },
+                                        onToggleCompare = { toggleCompareGame(game) },
+                                        onClick = { selectedGame = game }
+                                    )
+                                }
+                            }
+                        }
+
+                        ViewLayoutMode.LIST -> {
+                            LazyColumn(
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                                contentPadding = PaddingValues(bottom = 24.dp)
+                            ) {
+                                items(filteredAndSortedGames, key = { it.productId }) { game ->
+                                    GameCompactListCard(
+                                        game = game,
+                                        isSelectedForCompare = compareSelection.any { it.productId == game.productId },
+                                        onToggleFav = { toggleGameFavourite(game.productId) },
+                                        onToggleCompare = { toggleCompareGame(game) },
+                                        onClick = { selectedGame = game }
+                                    )
+                                }
+                            }
+                        }
+
+                        ViewLayoutMode.DETAILED -> {
+                            LazyColumn(
+                                verticalArrangement = Arrangement.spacedBy(14.dp),
+                                contentPadding = PaddingValues(bottom = 24.dp)
+                            ) {
+                                items(filteredAndSortedGames, key = { it.productId }) { game ->
+                                    GameDetailedCard(
+                                        game = game,
+                                        isSelectedForCompare = compareSelection.any { it.productId == game.productId },
+                                        onToggleFav = { toggleGameFavourite(game.productId) },
+                                        onToggleCompare = { toggleCompareGame(game) },
+                                        onClick = { selectedGame = game }
+                                    )
+                                }
                             }
                         }
                     }
@@ -476,14 +519,101 @@ fun XPriceMainScreen() {
             }
         }
 
+        // 2-Game Side-by-Side VS Comparator Dialog
+        if (showCompareDialog && compareSelection.size == 2) {
+            TwoGameCompareDialog(
+                gameA = compareSelection[0],
+                gameB = compareSelection[1],
+                onDismiss = {
+                    showCompareDialog = false
+                    compareSelection = emptyList()
+                }
+            )
+        }
+
+        // Owned Vault, Gaming Budget Tracker & Export/Backup Sheet
+        if (showVaultBudgetSheet) {
+            ModalBottomSheet(
+                onDismissRequest = { showVaultBudgetSheet = false },
+                containerColor = Color(0xFF131823)
+            ) {
+                VaultBudgetAndExportSheet(
+                    storage = storage,
+                    allKnownGames = (allGamesList + hotDealsList + gamePassList).distinctBy { it.productId }
+                )
+            }
+        }
+
+        // About Developer Dialog
+        if (showAboutDialog) {
+            AlertDialog(
+                onDismissRequest = { showAboutDialog = false },
+                containerColor = Color(0xFF131823),
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("RupeeVault X", fontWeight = FontWeight.Black, color = Color(0xFF10B981))
+                        Text(" • v4.0 Pro", fontSize = 14.sp, color = Color.Gray)
+                    }
+                },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Created & Engineered by:", fontSize = 12.sp, color = Color.Gray)
+                        Text("Yasir Sheriff", fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
+                        Text("Salesforce Lead Consultant & Engineering Lead", fontSize = 13.sp, color = Color(0xFFF59E0B), fontWeight = FontWeight.SemiBold)
+                        Text("Salem, Tamil Nadu, India", fontSize = 12.sp, color = Color.LightGray)
+                        HorizontalDivider(color = Color(0xFF263042))
+                        Text(
+                            "Complete XBDeals-grade Xbox India Store tracker with Multi-Edition SKU comparison, Bank/Gift Card cashback calculator, Sale countdown timers, Game Pass Leaving Soon radar, 2-game VS comparison, Owned Vault budget tracker, and Home Screen Glance Widget.",
+                            fontSize = 12.sp,
+                            color = Color.LightGray
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showAboutDialog = false }) {
+                        Text("Close", color = Color(0xFF10B981), fontWeight = FontWeight.Bold)
+                    }
+                }
+            )
+        }
+
+        // News Reader Sheet with Instant Store Price Lookup
+        selectedArticle?.let { article ->
+            ModalBottomSheet(
+                onDismissRequest = { selectedArticle = null },
+                containerColor = Color(0xFF131823)
+            ) {
+                NewsArticleReaderSheet(
+                    article = article,
+                    onCheckStorePrice = { extractedQuery ->
+                        selectedArticle = null
+                        activeTab = 0
+                        searchQuery = extractedQuery
+                    }
+                )
+            }
+        }
+
+        // Game Detail, Trailer, Editions, Bank Cashback & Price Chart Sheet
         selectedGame?.let { game ->
             ModalBottomSheet(
                 onDismissRequest = { selectedGame = null },
-                containerColor = Color(0xFF171920)
+                containerColor = Color(0xFF131823)
             ) {
                 GameDetailAnalysisSheet(
                     game = game,
                     onToggleFav = { toggleGameFavourite(game.productId) },
+                    onToggleOwned = { paidInr ->
+                        if (paidInr != null) {
+                            storage.markGameOwned(game.productId, game.title, paidInr, game.mrpInr)
+                            Toast.makeText(context, "💼 Added to Owned Vault (Paid ₹$paidInr)", Toast.LENGTH_SHORT).show()
+                        } else {
+                            storage.removeGameFromOwned(game.productId)
+                            Toast.makeText(context, "Removed from Owned Vault", Toast.LENGTH_SHORT).show()
+                        }
+                        selectedGame = null
+                        refreshActiveTab()
+                    },
                     onSaveAlert = { targetInr ->
                         storage.setPriceAlert(game.productId, game.title, targetInr)
                         Toast.makeText(context, "🔔 Alert set for ₹$targetInr!", Toast.LENGTH_SHORT).show()
@@ -493,13 +623,13 @@ fun XPriceMainScreen() {
                             )
                         }
                         selectedGame = null
-                        syncActiveCatalog()
+                        refreshActiveTab()
                     },
                     onRemoveAlert = {
                         storage.removePriceAlert(game.productId)
                         Toast.makeText(context, "Alert removed", Toast.LENGTH_SHORT).show()
                         selectedGame = null
-                        syncActiveCatalog()
+                        refreshActiveTab()
                     }
                 )
             }
@@ -507,12 +637,267 @@ fun XPriceMainScreen() {
     }
 }
 
+// =========================================================================
+// 2-GAME SIDE-BY-SIDE VS COMPARATOR DIALOG
+// =========================================================================
 @Composable
-fun GameGridCard(game: XboxGameDeal, onToggleFav: () -> Unit, onClick: () -> Unit) {
+fun TwoGameCompareDialog(gameA: XboxGameDeal, gameB: XboxGameDeal, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF131823),
+        title = {
+            Text("⚔️ Side-by-Side Game Comparison", fontWeight = FontWeight.Black, fontSize = 16.sp, color = Color(0xFF10B981))
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(gameA.title, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.White, modifier = Modifier.weight(1f), maxLines = 2)
+                    Text("VS", fontWeight = FontWeight.Black, fontSize = 12.sp, color = Color(0xFFF59E0B))
+                    Text(gameB.title, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.White, modifier = Modifier.weight(1f), maxLines = 2)
+                }
+                HorizontalDivider(color = Color(0xFF263042))
+                CompareMetricRow("Live Price", "₹${gameA.currentPriceInr}", "₹${gameB.currentPriceInr}")
+                CompareMetricRow("All-Time Low", "₹${gameA.lowestEverInr}", "₹${gameB.lowestEverInr}")
+                CompareMetricRow("Discount", "-${gameA.discountPercent}%", "-${gameB.discountPercent}%")
+                CompareMetricRow("User Score", "${gameA.starRating}★", "${gameB.starRating}★")
+                CompareMetricRow("Critic Score", "${gameA.criticScore}/100", "${gameB.criticScore}/100")
+                CompareMetricRow("Game Pass", if (gameA.isGamePass) "Included" else "No", if (gameB.isGamePass) "Included" else "No")
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Done", color = Color(0xFF10B981), fontWeight = FontWeight.Bold)
+            }
+        }
+    )
+}
+
+@Composable
+fun CompareMetricRow(label: String, valA: String, valB: String) {
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(valA, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981), modifier = Modifier.weight(1f))
+        Text(label, fontSize = 11.sp, color = Color.Gray, modifier = Modifier.weight(1f))
+        Text(valB, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFF59E0B), modifier = Modifier.weight(1f))
+    }
+}
+
+// =========================================================================
+// OWNED VAULT, MONTHLY BUDGET & CSV/JSON BACKUP EXPORT SHEET
+// =========================================================================
+@Composable
+fun VaultBudgetAndExportSheet(storage: PriceHistoryStorage, allKnownGames: List<XboxGameDeal>) {
+    val context = LocalContext.current
+    val ownedEntries = remember { storage.getOwnedVault().values.toList() }
+    val totalPaid = ownedEntries.sumOf { it.paidInr }
+    val totalMrp = ownedEntries.sumOf { it.mrpInr }
+    val totalSaved = (totalMrp - totalPaid).coerceAtLeast(0)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text("💼 My Xbox Vault & INR Budget Tracker", fontSize = 19.sp, fontWeight = FontWeight.Black, color = Color.White)
+
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PriceStatBox("OWNED GAMES", "${ownedEntries.size}", Color.White, Modifier.weight(1f))
+            PriceStatBox("TOTAL SPENT", "₹$totalPaid", Color(0xFFF59E0B), Modifier.weight(1f))
+            PriceStatBox("SAVED VS MRP", "₹$totalSaved", Color(0xFF10B981), Modifier.weight(1f))
+        }
+
+        if (ownedEntries.isEmpty()) {
+            Text("No games logged in your Owned Vault yet. Open any game and tap 'Mark as Owned' to track your spending & savings.", fontSize = 12.sp, color = Color.Gray)
+        } else {
+            ownedEntries.forEach { entry ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color(0xFF0E131D)).padding(10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(entry.title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.weight(1f), maxLines = 1)
+                    Text("Paid ₹${entry.paidInr} (MRP ₹${entry.mrpInr})", fontSize = 12.sp, color = Color(0xFF10B981))
+                }
+            }
+        }
+
+        HorizontalDivider(color = Color(0xFF263042))
+        Text("📤 Export & Backup Watchlist / Price Ledger", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.White)
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Button(
+                onClick = {
+                    val csv = storage.exportWatchlistAsCsv(allKnownGames)
+                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/csv"
+                        putExtra(Intent.EXTRA_SUBJECT, "RupeeVault X Watchlist Backup (CSV)")
+                        putExtra(Intent.EXTRA_TEXT, csv)
+                    }
+                    context.startActivity(Intent.createChooser(sendIntent, "Export Watchlist CSV"))
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
+            ) {
+                Text("Export CSV", color = Color.Black, fontWeight = FontWeight.Bold)
+            }
+
+            Button(
+                onClick = {
+                    val json = storage.exportWatchlistAsJson()
+                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "application/json"
+                        putExtra(Intent.EXTRA_SUBJECT, "RupeeVault X Full Ledger Backup (JSON)")
+                        putExtra(Intent.EXTRA_TEXT, json)
+                    }
+                    context.startActivity(Intent.createChooser(sendIntent, "Export Backup JSON"))
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B))
+            ) {
+                Text("Export JSON", color = Color.Black, fontWeight = FontWeight.Bold)
+            }
+        }
+        Spacer(modifier = Modifier.height(24.dp))
+    }
+}
+
+// =========================================================================
+// XBOX WIRE NEWS CARD & IN-APP READER WITH INSTANT STORE LOOKUP
+// =========================================================================
+@Composable
+fun XboxNewsCard(article: XboxWireArticle, onClick: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth().clickable { onClick() },
         shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF171920))
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF131823))
+    ) {
+        Column {
+            if (article.imageUrl.isNotBlank()) {
+                Box(modifier = Modifier.fillMaxWidth().height(155.dp)) {
+                    AsyncImage(
+                        model = article.imageUrl,
+                        contentDescription = article.title,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize().background(Color(0xFF1E2636))
+                    )
+                    Box(modifier = Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC131823)))))
+                    Box(modifier = Modifier.padding(10.dp).align(Alignment.TopStart)) {
+                        BadgePill(article.category.uppercase(), Color(0xFF10B981), Color.Black)
+                    }
+                }
+            }
+            Column(modifier = Modifier.padding(14.dp)) {
+                if (article.imageUrl.isBlank()) {
+                    BadgePill(article.category.uppercase(), Color(0xFF10B981), Color.Black)
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
+                Text(article.title, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, color = Color.White)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(article.publishedDate, fontSize = 11.sp, color = Color(0xFFF59E0B), fontWeight = FontWeight.SemiBold)
+                if (article.summary.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(article.summary, fontSize = 12.sp, color = Color.LightGray, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun NewsArticleReaderSheet(article: XboxWireArticle, onCheckStorePrice: (String) -> Unit) {
+    val context = LocalContext.current
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 10.dp)
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            BadgePill(article.category.uppercase(), Color(0xFF10B981), Color.Black)
+            Text(article.publishedDate, fontSize = 12.sp, color = Color(0xFFF59E0B), fontWeight = FontWeight.SemiBold)
+        }
+        Spacer(modifier = Modifier.height(10.dp))
+        Text(article.title, fontSize = 20.sp, fontWeight = FontWeight.Black, color = Color.White)
+
+        // Instant News-to-Store Price Lookup Button
+        if (article.extractedGameQuery.length >= 3) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Button(
+                onClick = { onCheckStorePrice(article.extractedGameQuery) },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B)),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Icon(Icons.Default.Search, contentDescription = null, tint = Color.Black)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("🔍 Check Live ₹ Price: '${article.extractedGameQuery}'", color = Color.Black, fontWeight = FontWeight.ExtraBold, fontSize = 13.sp)
+            }
+        }
+
+        if (article.imageUrl.isNotBlank()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            AsyncImage(
+                model = article.imageUrl,
+                contentDescription = article.title,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxWidth().height(185.dp).clip(RoundedCornerShape(14.dp)).background(Color(0xFF1E2636))
+            )
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+        Text(text = article.fullBody, fontSize = 14.sp, lineHeight = 21.sp, color = Color.LightGray)
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Button(
+            onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(article.articleUrl))) },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, tint = Color.Black)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Read Full Story on Xbox Wire", color = Color.Black, fontWeight = FontWeight.Black)
+        }
+        Spacer(modifier = Modifier.height(28.dp))
+    }
+}
+
+// =========================================================================
+// SHIMMER LOADING & GAME CARDS (WITH COUNTDOWN, LEAVING SOON & VS BUTTON)
+// =========================================================================
+@Composable
+fun ShimmerLoadingFeed() {
+    val transition = rememberInfiniteTransition(label = "shimmer")
+    val translateAnim by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1000f,
+        animationSpec = infiniteRepeatable(animation = tween(1100, easing = FastOutSlowInEasing), repeatMode = RepeatMode.Restart),
+        label = "shimmer_x"
+    )
+    val shimmerBrush = Brush.linearGradient(
+        colors = listOf(Color(0xFF131823), Color(0xFF243044), Color(0xFF131823)),
+        start = Offset(translateAnim - 300f, 0f),
+        end = Offset(translateAnim, 300f)
+    )
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        repeat(4) {
+            Box(modifier = Modifier.fillMaxWidth().height(180.dp).clip(RoundedCornerShape(18.dp)).background(shimmerBrush))
+        }
+    }
+}
+
+@Composable
+fun GameGridCard(
+    game: XboxGameDeal,
+    isSelectedForCompare: Boolean,
+    onToggleFav: () -> Unit,
+    onToggleCompare: () -> Unit,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable { onClick() },
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF131823))
     ) {
         Column {
             Box(modifier = Modifier.fillMaxWidth().height(175.dp)) {
@@ -520,75 +905,45 @@ fun GameGridCard(game: XboxGameDeal, onToggleFav: () -> Unit, onClick: () -> Uni
                     model = game.coverImageUrl,
                     contentDescription = game.title,
                     contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize().background(Color(0xFF232631))
+                    modifier = Modifier.fillMaxSize().background(Color(0xFF1E2636))
                 )
-                Box(
-                    modifier = Modifier.fillMaxSize().background(
-                        Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC0D0E12)))
-                    )
-                )
-                Row(
-                    modifier = Modifier.padding(8.dp).align(Alignment.TopStart),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    if (game.discountPercent > 0) {
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(Color(0xFF22C55E))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        ) {
-                            Text("-${game.discountPercent}%", color = Color.Black, fontWeight = FontWeight.Black, fontSize = 10.sp)
-                        }
+                Box(modifier = Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC090C12)))))
+                Row(modifier = Modifier.padding(8.dp).align(Alignment.TopStart), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (game.discountPercent > 0) BadgePill("-${game.discountPercent}%", Color(0xFF10B981), Color.Black)
+                    if (game.isLeavingGamePassSoon) BadgePill("⚠️ LEAVING", Color(0xFFEF4444), Color.White)
+                    else if (game.isNewLaunch) BadgePill("NEW", Color(0xFFF59E0B), Color.Black)
+                }
+                Row(modifier = Modifier.padding(6.dp).align(Alignment.TopEnd), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    IconButton(
+                        onClick = onToggleCompare,
+                        modifier = Modifier.size(28.dp).clip(CircleShape).background(if (isSelectedForCompare) Color(0xFFF59E0B) else Color(0x99000000))
+                    ) {
+                        Text("VS", fontSize = 9.sp, fontWeight = FontWeight.Black, color = if (isSelectedForCompare) Color.Black else Color.White)
                     }
-                    if (game.isGamePass) {
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(Color(0xFF107C10))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        ) {
-                            Text("GAME PASS", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 9.sp)
-                        }
+                    IconButton(
+                        onClick = onToggleFav,
+                        modifier = Modifier.size(28.dp).clip(CircleShape).background(Color(0x99000000))
+                    ) {
+                        Icon(
+                            imageVector = if (game.isFavourite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                            contentDescription = "Favourite",
+                            tint = if (game.isFavourite) Color(0xFFEF4444) else Color.White,
+                            modifier = Modifier.size(15.dp)
+                        )
                     }
                 }
-                IconButton(
-                    onClick = onToggleFav,
-                    modifier = Modifier
-                        .padding(6.dp)
-                        .size(32.dp)
-                        .align(Alignment.TopEnd)
-                        .clip(CircleShape)
-                        .background(Color(0x99000000))
-                ) {
-                    Icon(
-                        imageVector = if (game.isFavourite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                        contentDescription = "Favourite",
-                        tint = if (game.isFavourite) Color(0xFFEF4444) else Color.White,
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
                 Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(8.dp)
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(Color(0xDD171920))
-                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                    modifier = Modifier.align(Alignment.BottomStart).padding(8.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xDD131823)).padding(horizontal = 6.dp, vertical = 2.dp)
                 ) {
-                    Text(
-                        text = "${game.recommendationEmoji} ${if (game.isAtAllTimeLow) "Record Low" else "${game.starRating}★"}",
-                        fontSize = 11.sp,
-                        color = Color(0xFFF59E0B),
-                        fontWeight = FontWeight.Bold
-                    )
+                    Text("${game.recommendationEmoji} ${game.starRating}★", fontSize = 10.sp, color = Color(0xFFF59E0B), fontWeight = FontWeight.Bold)
                 }
             }
             Column(modifier = Modifier.padding(10.dp)) {
                 Text(game.title, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
-                    Text("₹${game.currentPriceInr}", fontSize = 17.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF22C55E))
+                    val priceLabel = if (game.currentPriceInr == 0) "FREE" else "₹${game.currentPriceInr}"
+                    Text(priceLabel, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF10B981))
                     if (game.discountPercent > 0) {
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("₹${game.mrpInr}", fontSize = 11.sp, color = Color.Gray, textDecoration = TextDecoration.LineThrough)
@@ -600,60 +955,65 @@ fun GameGridCard(game: XboxGameDeal, onToggleFav: () -> Unit, onClick: () -> Uni
 }
 
 @Composable
-fun GameCompactListCard(game: XboxGameDeal, onToggleFav: () -> Unit, onClick: () -> Unit) {
+fun GameCompactListCard(
+    game: XboxGameDeal,
+    isSelectedForCompare: Boolean,
+    onToggleFav: () -> Unit,
+    onToggleCompare: () -> Unit,
+    onClick: () -> Unit
+) {
     Card(
         modifier = Modifier.fillMaxWidth().clickable { onClick() },
         shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF171920))
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF131823))
     ) {
-        Row(
-            modifier = Modifier.padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+        Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
             AsyncImage(
                 model = game.coverImageUrl,
                 contentDescription = game.title,
                 contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .size(72.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(Color(0xFF232631))
+                modifier = Modifier.size(72.dp).clip(RoundedCornerShape(10.dp)).background(Color(0xFF1E2636))
             )
             Spacer(modifier = Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(game.title, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(
-                    text = "${game.genre} • ${game.starRating}★" + if (game.isGamePass) " • Game Pass" else "",
-                    fontSize = 11.sp,
-                    color = if (game.isGamePass) Color(0xFF22C55E) else Color.Gray
-                )
+                Text("${game.genre} • ${game.starRating}★" + if (game.saleCountdownText.isNotBlank()) " • ${game.saleCountdownText}" else "", fontSize = 11.sp, color = Color.Gray)
                 Spacer(modifier = Modifier.height(4.dp))
                 Text("${game.recommendationEmoji} ${game.dealRating}", fontSize = 11.sp, color = Color(0xFFF59E0B), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             Column(horizontalAlignment = Alignment.End) {
-                IconButton(onClick = onToggleFav, modifier = Modifier.size(28.dp)) {
-                    Icon(
-                        imageVector = if (game.isFavourite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                        contentDescription = "Favourite",
-                        tint = if (game.isFavourite) Color(0xFFEF4444) else Color.Gray,
-                        modifier = Modifier.size(18.dp)
-                    )
+                Row {
+                    IconButton(onClick = onToggleCompare, modifier = Modifier.size(26.dp)) {
+                        Text("VS", fontSize = 10.sp, fontWeight = FontWeight.Black, color = if (isSelectedForCompare) Color(0xFFF59E0B) else Color.Gray)
+                    }
+                    IconButton(onClick = onToggleFav, modifier = Modifier.size(26.dp)) {
+                        Icon(
+                            imageVector = if (game.isFavourite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                            contentDescription = "Favourite",
+                            tint = if (game.isFavourite) Color(0xFFEF4444) else Color.Gray,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
                 }
-                Text("₹${game.currentPriceInr}", fontSize = 17.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF22C55E))
-                if (game.discountPercent > 0) {
-                    Text("-${game.discountPercent}%", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF22C55E))
-                }
+                val priceLabel = if (game.currentPriceInr == 0) "FREE" else "₹${game.currentPriceInr}"
+                Text(priceLabel, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF10B981))
             }
         }
     }
 }
 
 @Composable
-fun GameDetailedCard(game: XboxGameDeal, onToggleFav: () -> Unit, onClick: () -> Unit) {
+fun GameDetailedCard(
+    game: XboxGameDeal,
+    isSelectedForCompare: Boolean,
+    onToggleFav: () -> Unit,
+    onToggleCompare: () -> Unit,
+    onClick: () -> Unit
+) {
     Card(
         modifier = Modifier.fillMaxWidth().clickable { onClick() },
         shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF171920))
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF131823))
     ) {
         Column {
             Box(modifier = Modifier.fillMaxWidth().height(165.dp)) {
@@ -661,76 +1021,58 @@ fun GameDetailedCard(game: XboxGameDeal, onToggleFav: () -> Unit, onClick: () ->
                     model = game.coverImageUrl,
                     contentDescription = game.title,
                     contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize().background(Color(0xFF232631))
+                    modifier = Modifier.fillMaxSize().background(Color(0xFF1E2636))
                 )
-                Box(
-                    modifier = Modifier.fillMaxSize().background(
-                        Brush.verticalGradient(listOf(Color(0x22000000), Color(0xE6171920)))
-                    )
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
+                Box(modifier = Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0x22000000), Color(0xEE131823)))))
+                Row(modifier = Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        if (game.discountPercent > 0) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0xFF22C55E))
-                                    .padding(horizontal = 10.dp, vertical = 4.dp)
-                            ) {
-                                Text("-${game.discountPercent}% OFF", color = Color.Black, fontWeight = FontWeight.Black, fontSize = 12.sp)
-                            }
-                        }
-                        if (game.isGamePass) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0xFF107C10))
-                                    .padding(horizontal = 10.dp, vertical = 4.dp)
-                            ) {
-                                Text("GAME PASS", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 11.sp)
-                            }
-                        }
+                        if (game.discountPercent > 0) BadgePill("-${game.discountPercent}% OFF", Color(0xFF10B981), Color.Black)
+                        if (game.isLeavingGamePassSoon) BadgePill("⚠️ LEAVING SOON", Color(0xFFEF4444), Color.White)
+                        else if (game.isNewLaunch) BadgePill("🆕 NEW", Color(0xFFF59E0B), Color.Black)
+                        if (game.isGamePass) BadgePill("GAME PASS", Color(0xFF107C10), Color.White)
                     }
-
-                    IconButton(
-                        onClick = onToggleFav,
-                        modifier = Modifier.size(36.dp).clip(CircleShape).background(Color(0x99000000))
-                    ) {
-                        Icon(
-                            imageVector = if (game.isFavourite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                            contentDescription = "Save Favourite",
-                            tint = if (game.isFavourite) Color(0xFFEF4444) else Color.White
-                        )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        IconButton(
+                            onClick = onToggleCompare,
+                            modifier = Modifier.size(34.dp).clip(CircleShape).background(if (isSelectedForCompare) Color(0xFFF59E0B) else Color(0x99000000))
+                        ) {
+                            Text("VS", fontSize = 11.sp, fontWeight = FontWeight.Black, color = if (isSelectedForCompare) Color.Black else Color.White)
+                        }
+                        IconButton(
+                            onClick = onToggleFav,
+                            modifier = Modifier.size(34.dp).clip(CircleShape).background(Color(0x99000000))
+                        ) {
+                            Icon(
+                                imageVector = if (game.isFavourite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                                contentDescription = "Save Favourite",
+                                tint = if (game.isFavourite) Color(0xFFEF4444) else Color.White
+                            )
+                        }
                     }
                 }
-
-                Column(
-                    modifier = Modifier.align(Alignment.BottomStart).padding(14.dp)
-                ) {
+                Column(modifier = Modifier.align(Alignment.BottomStart).padding(14.dp)) {
                     Text(game.title, fontWeight = FontWeight.ExtraBold, fontSize = 18.sp, color = Color.White)
-                    Text("${game.publisher} • ${game.genre} • ${game.starRating}★", fontSize = 12.sp, color = Color.LightGray)
+                    Text("${game.publisher} • ${game.starRating}★ (${game.ratingCount}) • Critic ${game.criticScore}/100", fontSize = 12.sp, color = Color.LightGray)
                 }
             }
 
             Column(modifier = Modifier.padding(14.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Row(verticalAlignment = Alignment.Bottom) {
-                        Text("₹${game.currentPriceInr}", fontSize = 24.sp, fontWeight = FontWeight.Black, color = Color(0xFF22C55E))
+                        val priceLabel = if (game.currentPriceInr == 0) "FREE TO PLAY" else "₹${game.currentPriceInr}"
+                        Text(priceLabel, fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color(0xFF10B981))
                         if (game.discountPercent > 0) {
                             Spacer(modifier = Modifier.width(8.dp))
                             Text("₹${game.mrpInr}", fontSize = 14.sp, color = Color.Gray, textDecoration = TextDecoration.LineThrough)
                         }
                     }
                     Column(horizontalAlignment = Alignment.End) {
-                        Text("All-Time Low: ₹${game.lowestEverInr}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF22C55E))
-                        Text("Tap for Trailer & Charts", fontSize = 11.sp, color = Color.Gray)
+                        if (game.saleCountdownText.isNotBlank()) {
+                            Text(game.saleCountdownText, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFF59E0B))
+                        } else if (game.currentPriceInr > 0) {
+                            Text("All-Time Low: ₹${game.lowestEverInr}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981))
+                        }
+                        Text(game.saleCadenceNote, fontSize = 10.sp, color = Color.Gray)
                     }
                 }
 
@@ -742,30 +1084,21 @@ fun GameDetailedCard(game: XboxGameDeal, onToggleFav: () -> Unit, onClick: () ->
                                 model = shotUrl,
                                 contentDescription = "Screenshot",
                                 contentScale = ContentScale.Crop,
-                                modifier = Modifier
-                                    .width(130.dp)
-                                    .height(74.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0xFF232631))
+                                modifier = Modifier.width(130.dp).height(74.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF1E2636))
                             )
                         }
                     }
                 }
 
                 Spacer(modifier = Modifier.height(10.dp))
-
                 Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(Color(0xFF222530))
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color(0xFF1D2432)).padding(horizontal = 12.dp, vertical = 8.dp)
                 ) {
                     Text(
                         text = "${game.recommendationEmoji} ${game.dealRating}",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
-                        color = if (game.isAtAllTimeLow) Color(0xFF22C55E) else Color(0xFFF59E0B)
+                        color = if (game.isAtAllTimeLow) Color(0xFF10B981) else Color(0xFFF59E0B)
                     )
                 }
             }
@@ -774,16 +1107,34 @@ fun GameDetailedCard(game: XboxGameDeal, onToggleFav: () -> Unit, onClick: () ->
 }
 
 @Composable
+fun BadgePill(text: String, bgColor: Color, textColor: Color) {
+    Box(
+        modifier = Modifier.clip(RoundedCornerShape(7.dp)).background(bgColor).padding(horizontal = 8.dp, vertical = 3.dp)
+    ) {
+        Text(text, color = textColor, fontWeight = FontWeight.Black, fontSize = 10.sp)
+    }
+}
+
+// =========================================================================
+// DETAIL SHEET: CASHBACK CALCULATOR + MULTI-EDITION SKU + SHARE + VAULT
+// =========================================================================
+@Composable
 fun GameDetailAnalysisSheet(
     game: XboxGameDeal,
     onToggleFav: () -> Unit,
+    onToggleOwned: (Int?) -> Unit,
     onSaveAlert: (Int) -> Unit,
     onRemoveAlert: () -> Unit
 ) {
     val context = LocalContext.current
     var playTrailer by remember { mutableStateOf(false) }
     var selectedTimeframe by remember { mutableStateOf("1Y") }
-    var targetPrice by remember { mutableIntStateOf(game.alertTargetInr ?: game.lowestEverInr) }
+    var targetPrice by remember { mutableIntStateOf(game.alertTargetInr ?: game.lowestEverInr.coerceAtLeast(100)) }
+    var lightboxIndex by remember { mutableStateOf<Int?>(null) }
+
+    // India Bank / Gift Card Cashback Discount % (0%, 5%, 8%, 10%)
+    var selectedCashbackPct by remember { mutableIntStateOf(0) }
+    val effectiveInr = ((game.currentPriceInr * (100 - selectedCashbackPct)) / 100.0).roundToInt()
 
     val activePoints = when (selectedTimeframe) {
         "1M" -> game.monthHistory
@@ -795,24 +1146,76 @@ fun GameDetailAnalysisSheet(
     val tfHigh = activePoints.maxOfOrNull { it.priceInr } ?: game.mrpInr
     val tfAvg = if (activePoints.isNotEmpty()) activePoints.map { it.priceInr }.average().roundToInt() else game.currentPriceInr
 
+    if (lightboxIndex != null && game.screenshotUrls.isNotEmpty()) {
+        val currentIdx = lightboxIndex!!.coerceIn(0, game.screenshotUrls.lastIndex)
+        Dialog(onDismissRequest = { lightboxIndex = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Column(
+                modifier = Modifier.fillMaxSize().background(Color(0xF205070B)).padding(16.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text("Screenshot ${currentIdx + 1} of ${game.screenshotUrls.size}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    IconButton(onClick = { lightboxIndex = null }) { Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White) }
+                }
+                Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                    AsyncImage(model = game.screenshotUrls[currentIdx], contentDescription = "Full", contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(12.dp)))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        IconButton(
+                            onClick = { lightboxIndex = if (currentIdx > 0) currentIdx - 1 else game.screenshotUrls.lastIndex },
+                            modifier = Modifier.clip(CircleShape).background(Color(0xAA000000))
+                        ) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Prev", tint = Color(0xFF10B981)) }
+                        IconButton(
+                            onClick = { lightboxIndex = if (currentIdx < game.screenshotUrls.lastIndex) currentIdx + 1 else 0 },
+                            modifier = Modifier.clip(CircleShape).background(Color(0xAA000000))
+                        ) { Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Next", tint = Color(0xFF10B981)) }
+                    }
+                }
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 12.dp)) {
+                    itemsIndexed(game.screenshotUrls) { idx, thumbUrl ->
+                        val isSel = idx == currentIdx
+                        AsyncImage(
+                            model = thumbUrl,
+                            contentDescription = "Thumb",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.width(90.dp).height(54.dp).clip(RoundedCornerShape(8.dp))
+                                .border(if (isSel) 2.5.dp else 0.dp, if (isSel) Color(0xFF10B981) else Color.Transparent, RoundedCornerShape(8.dp))
+                                .clickable { lightboxIndex = idx }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp, vertical = 10.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(game.title, fontSize = 20.sp, fontWeight = FontWeight.Black)
-                Text(
-                    text = "${game.genre} • ${game.starRating}★" + if (game.isGamePass) " • Game Pass India" else " • ID: ${game.productId}",
-                    color = Color.Gray,
-                    fontSize = 12.sp
-                )
+                Text("${game.publisher} • ${game.genre} • ${game.releaseDate}", color = Color.Gray, fontSize = 12.sp)
+            }
+            // One-Tap WhatsApp / Telegram Deal Share Button
+            IconButton(onClick = {
+                val shareMsg = "🎮 *${game.title}* on Xbox India Store!
+" +
+                    "💰 Live Price: *₹${game.currentPriceInr}* (MRP ₹${game.mrpInr}, -${game.discountPercent}%)
+" +
+                    "📉 All-Time Low: ₹${game.lowestEverInr}
+" +
+                    "${game.recommendationEmoji} ${game.dealRating}
+" +
+                    "🔗 ${game.storeUrl}"
+                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, shareMsg)
+                }
+                context.startActivity(Intent.createChooser(sendIntent, "Share Deal via WhatsApp / Telegram"))
+            }) {
+                Icon(Icons.Default.Share, contentDescription = "Share Deal", tint = Color(0xFF10B981))
             }
             IconButton(onClick = onToggleFav) {
                 Icon(
@@ -823,36 +1226,16 @@ fun GameDetailAnalysisSheet(
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(195.dp)
-                .clip(RoundedCornerShape(14.dp))
-                .background(Color.Black)
-        ) {
+        Box(modifier = Modifier.fillMaxWidth().height(190.dp).clip(RoundedCornerShape(14.dp)).background(Color.Black)) {
             if (playTrailer) {
                 InAppTrailerPlayer(videoUrl = game.trailerUrl)
             } else {
-                AsyncImage(
-                    model = game.coverImageUrl,
-                    contentDescription = game.title,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color(0x66000000))
-                        .clickable { playTrailer = true },
-                    contentAlignment = Alignment.Center
-                ) {
+                AsyncImage(model = game.coverImageUrl, contentDescription = game.title, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                Box(modifier = Modifier.fillMaxSize().background(Color(0x66000000)).clickable { playTrailer = true }, contentAlignment = Alignment.Center) {
                     Row(
-                        modifier = Modifier
-                            .clip(CircleShape)
-                            .background(Color(0xFF22C55E))
-                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        modifier = Modifier.clip(CircleShape).background(Color(0xFF10B981)).padding(horizontal = 16.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(Icons.Default.PlayArrow, contentDescription = "Play Trailer", tint = Color.Black)
@@ -865,114 +1248,58 @@ fun GameDetailAnalysisSheet(
 
         if (game.screenshotUrls.isNotEmpty()) {
             Spacer(modifier = Modifier.height(12.dp))
-            Text("Sample Screenshots", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.LightGray)
+            Text("Screenshots (Tap to view one by one)", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981))
             Spacer(modifier = Modifier.height(6.dp))
             LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(game.screenshotUrls) { shot ->
+                itemsIndexed(game.screenshotUrls) { index, shot ->
                     AsyncImage(
                         model = shot,
-                        contentDescription = "Game Screenshot",
+                        contentDescription = "Screenshot ${index + 1}",
                         contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .width(180.dp)
-                            .height(102.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(Color(0xFF232631))
+                        modifier = Modifier.width(175.dp).height(100.dp).clip(RoundedCornerShape(10.dp)).background(Color(0xFF1E2636)).clickable { lightboxIndex = index }
                     )
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(14.dp))
-
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF222530)),
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(game.recommendationEmoji, fontSize = 28.sp)
-                Spacer(modifier = Modifier.width(12.dp))
-                Column {
-                    Text("PURCHASE RECOMMENDATION", fontSize = 10.sp, color = Color.Gray, fontWeight = FontWeight.Bold)
-                    Text(game.dealRating, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("Price History (INR)", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("1M" to "Month", "1Y" to "Year", "ALL" to "All-Time").forEach { (code, label) ->
-                    FilterChip(
-                        selected = selectedTimeframe == code,
-                        onClick = { selectedTimeframe = code },
-                        label = { Text(label, fontSize = 11.sp) }
+        // India Bank & Gift Card Cashback Calculator
+        if (game.currentPriceInr > 0) {
+            Spacer(modifier = Modifier.height(14.dp))
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Text("💳 India Gift Card / Bank Cashback Calculator", fontWeight = FontWeight.ExtraBold, fontSize = 13.sp, color = Color.White)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(0 to "Store ₹", 5 to "5% Gift Card", 8 to "8% Paytm/UniPin", 10 to "10% Bank Offer").forEach { (pct, label) ->
+                            FilterChip(selected = selectedCashbackPct == pct, onClick = { selectedCashbackPct = pct }, label = { Text(label, fontSize = 11.sp) })
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Net Effective Cost: ₹$effectiveInr (Total Savings vs MRP: ₹${(game.mrpInr - effectiveInr).coerceAtLeast(0)})",
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 14.sp,
+                        color = Color(0xFF10B981)
                     )
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PriceStatBox("LOWEST", "₹$tfLow", Color(0xFF22C55E), Modifier.weight(1f))
-            PriceStatBox("AVERAGE", "₹$tfAvg", Color(0xFFF59E0B), Modifier.weight(1f))
-            PriceStatBox("HIGHEST", "₹$tfHigh", Color.LightGray, Modifier.weight(1f))
-        }
-
-        Spacer(modifier = Modifier.height(10.dp))
-
-        InteractivePriceHistoryChart(
-            points = activePoints,
-            lowestPrice = tfLow,
-            maxPrice = tfHigh
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF101217)),
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(modifier = Modifier.padding(14.dp)) {
-                Text("🔔 Target Price Drop Alert", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedIconButton(onClick = { targetPrice = (targetPrice - 100).coerceAtLeast(100) }) {
-                        Icon(Icons.Default.Remove, contentDescription = "Decrease")
-                    }
-                    Text("₹$targetPrice", fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color(0xFFF59E0B))
-                    OutlinedIconButton(onClick = { targetPrice = (targetPrice + 100).coerceAtMost(game.mrpInr) }) {
-                        Icon(Icons.Default.Add, contentDescription = "Increase")
-                    }
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = { onSaveAlert(targetPrice) },
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B)),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Icon(Icons.Default.NotificationsActive, contentDescription = null, tint = Color.Black)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Notify @ ₹$targetPrice", color = Color.Black, fontWeight = FontWeight.Bold)
-                    }
-                    if (game.alertTargetInr != null) {
-                        OutlinedIconButton(onClick = onRemoveAlert) {
-                            Icon(Icons.Default.Delete, contentDescription = "Delete Alert", tint = Color.Red)
+        // Multi-Edition & Bundle SKU Comparator
+        if (game.editions.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("📦 Available Store Editions & Bundles", fontWeight = FontWeight.ExtraBold, fontSize = 13.sp, color = Color.White)
+                    game.editions.forEach { ed ->
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(ed.skuTitle, fontSize = 12.sp, color = Color.LightGray, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                text = if (ed.priceInr == 0) "FREE" else if (ed.discountPercent > 0) "₹${ed.priceInr} (-${ed.discountPercent}%)" else "₹${ed.priceInr}",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF10B981)
+                            )
                         }
                     }
                 }
@@ -981,17 +1308,115 @@ fun GameDetailAnalysisSheet(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        Button(
+        // Ratings, Platforms & Game Intel
+        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2230)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("📊 Ratings, Platforms & Game Intel", fontWeight = FontWeight.ExtraBold, fontSize = 14.sp, color = Color.White)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PriceStatBox("XBOX USER SCORE", "${game.starRating}★ (${game.ratingCount})", Color(0xFFF59E0B), Modifier.weight(1f))
+                    PriceStatBox("CRITIC SCORE", "${game.criticScore} / 100", Color(0xFF10B981), Modifier.weight(1f))
+                }
+                Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    game.supportedPlatforms.forEach { plat -> BadgePill(plat, Color(0xFF283347), Color.White) }
+                }
+                Text(game.communityReviewSummary, fontSize = 12.sp, color = Color.LightGray)
+                Text(game.latestNewsHeadline, fontSize = 12.sp, color = Color(0xFF10B981), fontWeight = FontWeight.Medium)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Smart Buy Verdict
+        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1D2432)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+            Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(game.recommendationEmoji, fontSize = 28.sp)
+                Spacer(modifier = Modifier.width(12.dp))
+                Column {
+                    Text("SMART BUY VERDICT", fontSize = 10.sp, color = Color.Gray, fontWeight = FontWeight.Bold)
+                    Text(game.dealRating, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                }
+            }
+        }
+
+        if (game.currentPriceInr > 0) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("Price History (INR)", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("1M" to "Month", "1Y" to "Year", "ALL" to "All-Time").forEach { (code, label) ->
+                        FilterChip(selected = selectedTimeframe == code, onClick = { selectedTimeframe = code }, label = { Text(label, fontSize = 11.sp) })
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PriceStatBox("LOWEST", "₹$tfLow", Color(0xFF10B981), Modifier.weight(1f))
+                PriceStatBox("AVERAGE", "₹$tfAvg", Color(0xFFF59E0B), Modifier.weight(1f))
+                PriceStatBox("HIGHEST", "₹$tfHigh", Color.LightGray, Modifier.weight(1f))
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            InteractivePriceHistoryChart(points = activePoints, lowestPrice = tfLow, maxPrice = tfHigh)
+
+            Spacer(modifier = Modifier.height(14.dp))
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0E131D)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Text("🔔 Target Price Drop Alert", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedIconButton(onClick = { targetPrice = (targetPrice - 100).coerceAtLeast(100) }) { Icon(Icons.Default.Remove, contentDescription = "Decrease") }
+                        Text("₹$targetPrice", fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color(0xFFF59E0B))
+                        OutlinedIconButton(onClick = { targetPrice = (targetPrice + 100).coerceAtMost(game.mrpInr) }) { Icon(Icons.Default.Add, contentDescription = "Increase") }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { onSaveAlert(targetPrice) },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B)),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.NotificationsActive, contentDescription = null, tint = Color.Black)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Notify @ ₹$targetPrice", color = Color.Black, fontWeight = FontWeight.Bold)
+                        }
+                        if (game.alertTargetInr != null) {
+                            OutlinedIconButton(onClick = onRemoveAlert) { Icon(Icons.Default.Delete, contentDescription = "Delete", tint = Color.Red) }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Owned Vault Toggle Button
+        Spacer(modifier = Modifier.height(12.dp))
+        OutlinedButton(
             onClick = {
-                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(game.storeUrl)))
+                if (game.ownedPaidInr != null) onToggleOwned(null) else onToggleOwned(effectiveInr)
             },
             modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22C55E)),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = if (game.ownedPaidInr != null) Color(0xFF10B981) else Color.Gray)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = if (game.ownedPaidInr != null) "💼 Owned in Vault (Paid ₹${game.ownedPaidInr}) — Tap to Remove" else "💼 Mark as Owned in My Vault (@ ₹$effectiveInr)",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp
+            )
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+        Button(
+            onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(game.storeUrl))) },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
             shape = RoundedCornerShape(12.dp)
         ) {
             Icon(Icons.Default.ShoppingCart, contentDescription = null, tint = Color.Black)
             Spacer(modifier = Modifier.width(8.dp))
-            Text("Buy on Xbox Store India (₹${game.currentPriceInr})", color = Color.Black, fontWeight = FontWeight.Black)
+            val btnLabel = if (game.currentPriceInr == 0) "Get Free on Xbox Store India" else "Buy on Xbox Store India (₹${game.currentPriceInr})"
+            Text(btnLabel, color = Color.Black, fontWeight = FontWeight.Black)
         }
         Spacer(modifier = Modifier.height(28.dp))
     }
@@ -1007,18 +1432,9 @@ fun InAppTrailerPlayer(videoUrl: String) {
             playWhenReady = true
         }
     }
-
-    DisposableEffect(Unit) {
-        onDispose { exoPlayer.release() }
-    }
-
+    DisposableEffect(Unit) { onDispose { exoPlayer.release() } }
     AndroidView(
-        factory = { ctx ->
-            PlayerView(ctx).apply {
-                player = exoPlayer
-                useController = true
-            }
-        },
+        factory = { ctx -> PlayerView(ctx).apply { player = exoPlayer; useController = true } },
         modifier = Modifier.fillMaxSize()
     )
 }
@@ -1026,15 +1442,12 @@ fun InAppTrailerPlayer(videoUrl: String) {
 @Composable
 fun PriceStatBox(label: String, value: String, valueColor: Color, modifier: Modifier = Modifier) {
     Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(10.dp))
-            .background(Color(0xFF101217))
-            .padding(vertical = 8.dp, horizontal = 6.dp),
+        modifier = modifier.clip(RoundedCornerShape(10.dp)).background(Color(0xFF0E131D)).padding(vertical = 8.dp, horizontal = 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(label, fontSize = 10.sp, color = Color.Gray, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(2.dp))
-        Text(value, fontSize = 15.sp, color = valueColor, fontWeight = FontWeight.ExtraBold)
+        Text(value, fontSize = 14.sp, color = valueColor, fontWeight = FontWeight.ExtraBold)
     }
 }
 
@@ -1044,41 +1457,28 @@ fun InteractivePriceHistoryChart(points: List<PricePoint>, lowestPrice: Int, max
     val activePt = points.getOrNull(selectedIdx)
 
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color(0xFF101217))
-            .padding(12.dp)
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFF0E131D)).padding(12.dp)
     ) {
         if (activePt != null) {
-            Text(
-                text = "Selected: ${activePt.label} → ₹${activePt.priceInr}",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF22C55E)
-            )
+            Text("Selected: ${activePt.label} → ₹${activePt.priceInr}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF10B981))
             Spacer(modifier = Modifier.height(8.dp))
         }
-
         Canvas(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(130.dp)
-                .pointerInput(points) {
-                    detectTapGestures { tapOffset ->
-                        if (points.size > 1) {
-                            val step = size.width.toFloat() / (points.size - 1)
-                            selectedIdx = (tapOffset.x / step).roundToInt().coerceIn(0, points.lastIndex)
-                        }
+            modifier = Modifier.fillMaxWidth().height(130.dp).pointerInput(points) {
+                detectTapGestures { tapOffset ->
+                    if (points.size > 1) {
+                        val step = size.width.toFloat() / (points.size - 1)
+                        selectedIdx = (tapOffset.x / step).roundToInt().coerceIn(0, points.lastIndex)
                     }
                 }
+            }
         ) {
             if (points.isEmpty()) return@Canvas
             val stepX = size.width / (points.size - 1).coerceAtLeast(1)
             val range = (maxPrice - lowestPrice).coerceAtLeast(100)
 
             drawLine(
-                color = Color(0xFF22C55E).copy(alpha = 0.45f),
+                color = Color(0xFF10B981).copy(alpha = 0.45f),
                 start = Offset(0f, size.height),
                 end = Offset(size.width, size.height),
                 strokeWidth = 2f,
@@ -1090,17 +1490,15 @@ fun InteractivePriceHistoryChart(points: List<PricePoint>, lowestPrice: Int, max
                 val x = idx * stepX
                 val y = ((1f - ((pt.priceInr - lowestPrice).toFloat() / range)) * size.height).coerceIn(8f, size.height - 8f)
                 if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
-
                 val isSelected = idx == selectedIdx
                 drawCircle(
-                    color = if (isSelected) Color(0xFFF59E0B) else Color(0xFF22C55E),
+                    color = if (isSelected) Color(0xFFF59E0B) else Color(0xFF10B981),
                     radius = if (isSelected) 11f else 7f,
                     center = Offset(x, y)
                 )
             }
-            drawPath(path = path, color = Color(0xFF22C55E), style = Stroke(width = 4f))
+            drawPath(path = path, color = Color(0xFF10B981), style = Stroke(width = 4f))
         }
-
         Spacer(modifier = Modifier.height(6.dp))
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             points.forEach { Text(it.label, fontSize = 10.sp, color = Color.Gray) }

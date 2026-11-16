@@ -5,8 +5,8 @@
 
     <application
         android:allowBackup="true"
-        android:icon="@drawable/ic_xprice_logo"
-        android:label="XPrice India"
+        android:icon="@drawable/ic_rupeevault_logo"
+        android:label="RupeeVault X"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
@@ -18,5 +18,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Home Screen Price-Drop Glance Widget -->
+        <receiver
+            android:name=".widget.RupeeVaultWidgetReceiver"
+            android:exported="true"
+            android:label="RupeeVault X Live Deals">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/rupeevault_widget_info" />
+        </receiver>
     </application>
 </manifest>
