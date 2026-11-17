@@ -78,6 +78,12 @@ class PriceHistoryStorage(context: Context) {
         saveOwnedVault(getOwnedVault().filterValues { !it.fromXbox })
     }
 
+    /** Xbox sign-in client ID entered in the app; empty = use the built-in one. */
+    fun getXboxClientIdOverride(): String = prefs.getString("xbox_client_id_override", "") ?: ""
+    fun setXboxClientIdOverride(id: String) {
+        prefs.edit().putString("xbox_client_id_override", id.trim()).apply()
+    }
+
     // ---------------------------------------------------------------------
     // Favourites
     // ---------------------------------------------------------------------
@@ -250,6 +256,24 @@ class PriceHistoryStorage(context: Context) {
         saveHistory(productId, merged)
     }
 
+    // --- Archived snapshots (web.archive.org), kept separate because they are sparse ---
+    fun getArchive(productId: String): List<PricePoint> {
+        val raw = prefs.getString("archive_v1_$productId", null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i -> arr.getJSONArray(i).let { PricePoint(it.getLong(0), it.getInt(1)) } }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun saveArchive(productId: String, points: List<PricePoint>) {
+        val arr = JSONArray()
+        points.filter { it.priceInr > 0 }.sortedBy { it.epochDay }.distinctBy { it.epochDay }
+            .forEach { arr.put(JSONArray().put(it.epochDay).put(it.priceInr)) }
+        prefs.edit().putString("archive_v1_$productId", arr.toString()).apply()
+    }
+
     // --- Shared history sync bookkeeping ---
     fun remoteHistoryFetchedAt(productId: String): Long = prefs.getLong("remote_hist_ts_$productId", 0L)
     fun markRemoteHistoryFetched(productId: String) {
@@ -293,7 +317,8 @@ class PriceHistoryStorage(context: Context) {
         val owned = getOwnedVault()
         return deals.map { d ->
             val history = getHistory(d.productId)
-            val tracked = history.map { it.priceInr }.filter { it > 0 }
+            val archive = getArchive(d.productId)
+            val tracked = (history + archive).map { it.priceInr }.filter { it > 0 }
             val legacyLow = legacyLowest(d.productId).takeIf { it > 0 }
             val lowest = listOfNotNull(tracked.minOrNull(), legacyLow, d.currentPriceInr.takeIf { it > 0 }).minOrNull() ?: 0
             val highest = maxOf(d.mrpInr, tracked.maxOrNull() ?: 0, d.currentPriceInr)
@@ -303,6 +328,7 @@ class PriceHistoryStorage(context: Context) {
                 ownedPaidInr = owned[d.productId]?.let { it.paidInr ?: it.currentInr },
                 alertTargetInr = alerts[d.productId]?.targetPriceInr,
                 history = history,
+                archive = archive,
                 lowestEverInr = lowest,
                 highestEverInr = highest,
                 isAtAllTimeLow = atLow,

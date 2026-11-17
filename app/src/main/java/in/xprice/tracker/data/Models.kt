@@ -69,12 +69,15 @@ data class XboxGameDeal(
     val ownedPaidInr: Int? = null,
     val alertTargetInr: Int? = null,
     val history: List<PricePoint> = emptyList(),
+    /** Sparse genuine prices read from archived xbox.com pages (web.archive.org), oldest first. */
+    val archive: List<PricePoint> = emptyList(),
     val lowestEverInr: Int = currentPriceInr.coerceAtLeast(0),
     val highestEverInr: Int = maxOf(mrpInr, currentPriceInr),
     val isAtAllTimeLow: Boolean = false,
     val verdict: DealVerdict = DealVerdict.FULL_PRICE
 ) {
     val trackingSince: LocalDate? get() = history.firstOrNull()?.date
+    val archiveSince: LocalDate? get() = archive.firstOrNull()?.date
 
     fun saleCountdownText(now: Long = System.currentTimeMillis()): String {
         if (saleEndsAtMs <= now) return ""

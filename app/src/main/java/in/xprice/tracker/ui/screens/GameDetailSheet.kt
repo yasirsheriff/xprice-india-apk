@@ -178,7 +178,7 @@ fun GameDetailSheet(
                 }
             }
             Spacer(Modifier.height(6.dp))
-            PriceHistoryChart(history = game.history, mrp = game.mrpInr, currentPrice = game.currentPriceInr, range = range)
+            PriceHistoryChart(history = game.history, archive = game.archive, mrp = game.mrpInr, currentPrice = game.currentPriceInr, range = range)
             Spacer(Modifier.height(8.dp))
 
             val since = game.trackingSince
@@ -188,7 +188,13 @@ fun GameDetailSheet(
                 else "Tracking starts today",
                 color = Lw.TextSecondary, fontSize = 12.sp
             )
-            if (changes == 0) {
+            game.archiveSince?.let { since ->
+                Text(
+                    "Plus ${game.archive.size} archived price${if (game.archive.size == 1) "" else "s"} since ${since.formatShort()} from saved copies of the Xbox Store page (web.archive.org)",
+                    color = Lw.TextSecondary, fontSize = 12.sp
+                )
+            }
+            if (changes == 0 && game.archive.isEmpty()) {
                 Spacer(Modifier.height(4.dp))
                 Text(
                     "No price changes recorded yet. History comes from Lootwise's daily check of every Xbox India game, " +

@@ -96,13 +96,19 @@ class XboxStoreRepository(context: Context) {
                 async {
                     val body = httpGetText("$SHARED_DATA_BASE/prices/$pid.json")
                     storage.markRemoteHistoryFetched(pid)
-                    val arr = body?.let { try { JSONObject(it).optJSONArray("h") } catch (_: Exception) { null } } ?: return@async false
-                    val points = (0 until arr.length()).mapNotNull { i ->
-                        val pair = arr.optJSONArray(i) ?: return@mapNotNull null
-                        val day = try { java.time.LocalDate.parse(pair.getString(0)).toEpochDay() } catch (_: Exception) { return@mapNotNull null }
-                        PricePoint(day, pair.optInt(1, -1))
-                    }.filter { it.priceInr > 0 }
-                    if (points.isEmpty()) return@async false
+                    val json = body?.let { try { JSONObject(it) } catch (_: Exception) { null } } ?: return@async false
+                    fun points(key: String): List<PricePoint> {
+                        val arr = json.optJSONArray(key) ?: return emptyList()
+                        return (0 until arr.length()).mapNotNull { i ->
+                            val row = arr.optJSONArray(i) ?: return@mapNotNull null
+                            val day = try { java.time.LocalDate.parse(row.getString(0)).toEpochDay() } catch (_: Exception) { return@mapNotNull null }
+                            PricePoint(day, row.optInt(1, -1))
+                        }.filter { it.priceInr > 0 }
+                    }
+                    val archive = points("a")
+                    if (archive.isNotEmpty()) storage.saveArchive(pid, archive)
+                    val points = points("h")
+                    if (points.isEmpty()) return@async archive.isNotEmpty()
                     // Change points only: the last price was still valid on the collector's last run.
                     val terminal = PricePoint(maxOf(updatedDay, points.last().epochDay), points.last().priceInr)
                     storage.mergePoints(pid, points + terminal)
@@ -361,7 +367,8 @@ class XboxStoreRepository(context: Context) {
 
                         val actions = av.optJSONArray("Actions")
                         val canPurchase = actions != null && (0 until actions.length()).any { actions.optString(it).equals("Purchase", true) }
-                        if (!canPurchase) continue
+                        // Skip member-only offers (Game Pass / EA Play discounts need a subscription).
+                        if (!canPurchase || av.optBoolean("RemediationRequired", false)) continue
 
                         val price = av.optJSONObject("OrderManagementData")?.optJSONObject("Price") ?: continue
                         val list = price.optDouble("ListPrice", -1.0)

@@ -34,8 +34,8 @@ data class XboxAuthSyncResult(
 
 class XboxAuthException(message: String) : Exception(message)
 
-/** One sign-in attempt: PKCE verifier + anti-forgery state. */
-class OAuthSession internal constructor(val verifier: String, val challenge: String, val state: String)
+/** One sign-in attempt: client ID + PKCE verifier + anti-forgery state. */
+class OAuthSession internal constructor(val clientId: String, val verifier: String, val challenge: String, val state: String)
 
 /**
  * Microsoft account -> Xbox Live sign-in, using this app's own Microsoft app registration
@@ -56,9 +56,11 @@ class XboxLiveAuthManager {
     private val jsonMedia = "application/json".toMediaType()
 
     companion object {
-        /** Set XBOX_CLIENT_ID in gradle.properties (Azure app registration → Application (client) ID). */
-        val CLIENT_ID: String = `in`.xprice.tracker.BuildConfig.XBOX_CLIENT_ID.trim()
-        val isConfigured: Boolean get() = CLIENT_ID.isNotEmpty()
+        /** Built-in default from gradle.properties (XBOX_CLIENT_ID). Can be overridden in the app. */
+        val BUILT_IN_CLIENT_ID: String = `in`.xprice.tracker.BuildConfig.XBOX_CLIENT_ID.trim()
+        private val GUID_REGEX = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+        fun isValidClientId(id: String): Boolean = GUID_REGEX.matches(id.trim())
 
         const val REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
         private const val AUTHORITY = "https://login.microsoftonline.com/consumers/oauth2/v2.0"
@@ -66,7 +68,7 @@ class XboxLiveAuthManager {
 
         private val STORE_ID_REGEX = Regex("^[9BC][A-Z0-9]{11}$")
 
-        fun newSession(): OAuthSession {
+        fun newSession(clientId: String): OAuthSession {
             val rnd = java.security.SecureRandom()
             fun b64(bytes: ByteArray) = android.util.Base64.encodeToString(
                 bytes, android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP
@@ -74,12 +76,12 @@ class XboxLiveAuthManager {
             val verifier = b64(ByteArray(48).also { rnd.nextBytes(it) })
             val challenge = b64(java.security.MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.US_ASCII)))
             val state = b64(ByteArray(16).also { rnd.nextBytes(it) })
-            return OAuthSession(verifier, challenge, state)
+            return OAuthSession(clientId.trim(), verifier, challenge, state)
         }
 
         fun authorizeUrl(session: OAuthSession): String {
             fun enc(s: String) = java.net.URLEncoder.encode(s, "UTF-8")
-            return "$AUTHORITY/authorize?client_id=${enc(CLIENT_ID)}" +
+            return "$AUTHORITY/authorize?client_id=${enc(session.clientId)}" +
                 "&response_type=code" +
                 "&redirect_uri=${enc(REDIRECT_URI)}" +
                 "&response_mode=query" +
@@ -127,7 +129,7 @@ class XboxLiveAuthManager {
 
     private fun exchangeCode(code: String, session: OAuthSession): String {
         val form = okhttp3.FormBody.Builder()
-            .add("client_id", CLIENT_ID)
+            .add("client_id", session.clientId)
             .add("grant_type", "authorization_code")
             .add("code", code)
             .add("redirect_uri", REDIRECT_URI)
