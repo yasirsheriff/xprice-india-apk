@@ -100,6 +100,7 @@ fun LootwiseApp(vm: MainViewModel = viewModel()) {
                     onSignIn = { if (vm.beginXboxSignIn()) showSignIn = true },
                     onSignOut = vm::signOutXbox,
                     onDismissError = vm::dismissSyncError,
+                    onSignInSettings = { vm.showClientIdSetup = true },
                     onExportCsv = { vm.storage.exportWatchlistAsCsv(vm.allKnownGames()) },
                     onExportJson = { vm.storage.exportWatchlistAsJson() }
                 )
@@ -172,6 +173,14 @@ fun LootwiseApp(vm: MainViewModel = viewModel()) {
             onDismiss = { showSignIn = false; vm.cancelXboxSignIn() },
             onCodeCaptured = { showSignIn = false; vm.onXboxCodeCaptured(it) },
             onError = { showSignIn = false; vm.onXboxSignInError(it) }
+        )
+    }
+    if (vm.showClientIdSetup) {
+        XboxClientIdDialog(
+            currentOverride = vm.xboxClientIdOverride,
+            builtIn = XboxLiveAuthManager.BUILT_IN_CLIENT_ID,
+            onSave = { vm.saveXboxClientId(it) },
+            onDismiss = { vm.showClientIdSetup = false }
         )
     }
     if (showAbout) AboutDialog { showAbout = false }

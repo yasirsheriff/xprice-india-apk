@@ -337,17 +337,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var oauthSession by mutableStateOf<OAuthSession?>(null)
         private set
 
+    /** Client ID in use: the one entered in the app, else the built-in one. */
+    var xboxClientIdOverride by mutableStateOf(storage.getXboxClientIdOverride())
+        private set
+    val effectiveXboxClientId: String
+        get() = xboxClientIdOverride.ifBlank { XboxLiveAuthManager.BUILT_IN_CLIENT_ID }
+
+    /** Shown when sign-in is tapped but no client ID is available yet. */
+    var showClientIdSetup by mutableStateOf(false)
+
+    fun saveXboxClientId(id: String) {
+        storage.setXboxClientIdOverride(id)
+        xboxClientIdOverride = id.trim()
+        showClientIdSetup = false
+        messageChannel.trySend(if (id.isBlank()) "Using the built-in Xbox client ID" else "Xbox client ID saved")
+    }
+
     /** Returns true if the sign-in screen should open. */
     fun beginXboxSignIn(): Boolean {
-        if (!XboxLiveAuthManager.isConfigured) {
-            syncState = SyncState.Failed(
-                "Xbox sign-in isn't set up in this build yet. Add your Azure app's client ID as XBOX_CLIENT_ID in gradle.properties and rebuild."
-            )
+        val clientId = effectiveXboxClientId
+        if (!XboxLiveAuthManager.isValidClientId(clientId)) {
+            showClientIdSetup = true
             return false
         }
         tokenHandled = false
         syncState = SyncState.Idle
-        oauthSession = XboxLiveAuthManager.newSession()
+        oauthSession = XboxLiveAuthManager.newSession(clientId)
         return true
     }
 

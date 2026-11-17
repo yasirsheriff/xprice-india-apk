@@ -14,6 +14,10 @@ Output (written into --data-dir, committed to the `price-data` branch by CI):
   lists/deals.json          discounted games, biggest discount first
   lists/new.json            released in the last 120 days, newest first
   skip.json                 non-game product IDs (DLC, currency...), re-checked weekly
+  archive/progress.json     archive backfill progress (see archive.py)
+
+prices/<ID>.json may also hold "a": [["YYYY-MM-DD", priceInr, mrpInr], ...] -- prices read from
+archived copies of the xbox.com/en-IN product page on web.archive.org (sparse, but genuine).
 
 Only the Python standard library is used.
 """
@@ -62,17 +66,18 @@ def http_get(url, retries=4, timeout=40):
 
 # --------------------------------------------------------------------------- discovery
 def sitemap_ids():
+    """Returns {productId: product page URL} for every en-IN product page."""
     index = http_get(SITEMAP_INDEX) or ""
     maps = sorted(set(re.findall(r"https://www\.xbox\.com/sitemap/pdp-en-IN-sitemap-\d+\.xml\.gz", index)))
-    ids = set()
+    pages = {}
     for m in maps:
         body = http_get(m) or ""
         for loc in re.findall(r"<loc>([^<]+)</loc>", body):
             pid = loc.rstrip("/").rsplit("/", 1)[-1].upper()
             if ID_RE.match(pid):
-                ids.add(pid)
-    print(f"sitemap: {len(maps)} files, {len(ids)} product IDs")
-    return ids
+                pages[pid] = loc.rstrip("/")
+    print(f"sitemap: {len(maps)} files, {len(pages)} product IDs")
+    return pages
 
 
 def gamepass_ids():
@@ -117,8 +122,8 @@ def parse_product(p, today):
     best_price, best_msrp, best_sku = None, None, None
     for sku in p.get("DisplaySkuAvailabilities") or []:
         for av in sku.get("Availabilities") or []:
-            if "Purchase" not in (av.get("Actions") or []):
-                continue
+            if "Purchase" not in (av.get("Actions") or []) or av.get("RemediationRequired"):
+                continue  # not buyable, or a member-only (Game Pass / EA Play) price
             price = (av.get("OrderManagementData") or {}).get("Price") or {}
             lp, msrp = price.get("ListPrice", -1), price.get("MSRP", -1)
             if lp and msrp and lp > 0 and msrp > 0 and (best_price is None or lp < best_price):
@@ -205,6 +210,8 @@ def main():
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-ids", type=int, default=0, help="limit for local testing")
+    ap.add_argument("--backfill-minutes", type=float, default=0, help="time budget for the web.archive.org backfill")
+    ap.add_argument("--backfill-top", type=int, default=1500, help="backfill the N most-rated games")
     args = ap.parse_args()
 
     today = dt.datetime.now(IST).date()
@@ -218,7 +225,8 @@ def main():
     skip_ids = set() if recheck else set(skip["ids"])
 
     known = {f[:-5] for f in os.listdir(prices_dir) if f.endswith(".json")}
-    ids = sorted((sitemap_ids() | gamepass_ids() | known) - skip_ids)
+    pages = sitemap_ids()
+    ids = sorted((set(pages) | gamepass_ids() | known) - skip_ids)
     if args.max_ids:
         ids = ids[: args.max_ids]
     print(f"checking {len(ids)} products ({'full re-check' if recheck else f'{len(skip_ids)} skipped'})")
@@ -254,7 +262,10 @@ def main():
         path = os.path.join(prices_dir, f"{g['id']}.json")
         old = load_json(path, {})
         hist = merge_history(old.get("h", []), g["windows"], today, g["price"])
-        if write_if_changed(path, {"id": g["id"], "title": g["title"], "h": hist}):
+        out = {"id": g["id"], "title": g["title"], "h": hist}
+        if old.get("a"):
+            out["a"] = old["a"]
+        if write_if_changed(path, out):
             changed += 1
 
     def row(g):
@@ -283,6 +294,12 @@ def main():
         "failedBatches": failed_batches,
     })
     print(f"done: {len(games)} priced games, {changed} history files changed, {len(new_skips)} non-games, {failed_batches} failed batches")
+
+    if args.backfill_minutes > 0:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import archive  # noqa: E402
+        ranked = [g["id"] for g in sorted(games, key=lambda g: -g["ratings"])][: args.backfill_top]
+        archive.backfill(args.data_dir, ranked, pages, args.backfill_minutes)
 
 
 if __name__ == "__main__":

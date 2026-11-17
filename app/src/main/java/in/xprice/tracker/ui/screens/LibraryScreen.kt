@@ -31,6 +31,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import `in`.xprice.tracker.data.OwnedVaultEntry
+import `in`.xprice.tracker.data.XboxLiveAuthManager
 import `in`.xprice.tracker.data.XboxPlayerProfile
 import `in`.xprice.tracker.data.formatInr
 import `in`.xprice.tracker.ui.SyncState
@@ -48,6 +49,7 @@ fun LibraryScreen(
     onSignIn: () -> Unit,
     onSignOut: () -> Unit,
     onDismissError: () -> Unit,
+    onSignInSettings: () -> Unit,
     onExportCsv: () -> String,
     onExportJson: () -> String
 ) {
@@ -86,7 +88,7 @@ fun LibraryScreen(
         contentPadding = PaddingValues(bottom = 24.dp)
     ) {
         item {
-            ProfileHeader(profile, syncState, onSignIn, onSignOut = { confirmSignOut = true }, onDismissError)
+            ProfileHeader(profile, syncState, onSignIn, onSignOut = { confirmSignOut = true }, onDismissError, onSignInSettings)
         }
 
         item {
@@ -179,7 +181,8 @@ private fun ProfileHeader(
     syncState: SyncState,
     onSignIn: () -> Unit,
     onSignOut: () -> Unit,
-    onDismissError: () -> Unit
+    onDismissError: () -> Unit,
+    onSignInSettings: () -> Unit
 ) {
     Column(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(Lw.Surface)
@@ -243,6 +246,11 @@ private fun ProfileHeader(
             Icon(if (profile.isConnected) Icons.Default.Sync else Icons.Default.Login, null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(8.dp))
             Text(if (profile.isConnected) "Sync again" else "Sign in with Microsoft", fontWeight = FontWeight.SemiBold)
+        }
+        TextButton(onClick = onSignInSettings, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+            Icon(Icons.Default.Settings, null, tint = Lw.TextMuted, modifier = Modifier.size(14.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("Sign-in settings", color = Lw.TextMuted, fontSize = 12.sp)
         }
     }
 }
@@ -366,4 +374,65 @@ fun XboxSignInDialog(
             )
         }
     }
+}
+
+// =========================================================================
+// Xbox sign-in setup (client ID)
+// =========================================================================
+@Composable
+fun XboxClientIdDialog(
+    currentOverride: String,
+    builtIn: String,
+    onSave: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var value by remember { mutableStateOf(currentOverride.ifBlank { builtIn }) }
+    val trimmed = value.trim()
+    val valid = trimmed.isEmpty() || XboxLiveAuthManager.isValidClientId(trimmed)
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Lw.Surface,
+        title = { Text("Xbox sign-in setup", color = Lw.TextPrimary) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Sign-in uses a free Microsoft app registration. One client ID works for everyone who uses this app, " +
+                        "and each person still signs in with their own Microsoft account.",
+                    color = Lw.TextSecondary, fontSize = 13.sp
+                )
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = { value = it },
+                    label = { Text("Application (client) ID") },
+                    placeholder = { Text("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx") },
+                    singleLine = true,
+                    isError = !valid,
+                    supportingText = { if (!valid) Text("Should look like 1a2b3c4d-1234-5678-9abc-0123456789ab") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("To create one (5 min):", color = Lw.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "1. portal.azure.com → App registrations → New registration\n" +
+                        "2. Account type: Personal Microsoft accounts only\n" +
+                        "3. Redirect URI: Public client/native →\n    ${XboxLiveAuthManager.REDIRECT_URI}\n" +
+                        "4. Authentication → Allow public client flows: Yes\n" +
+                        "5. Copy the Application (client) ID here",
+                    color = Lw.TextSecondary, fontSize = 12.sp, lineHeight = 17.sp
+                )
+                TextButton(
+                    onClick = { clipboard.setText(androidx.compose.ui.text.AnnotatedString(XboxLiveAuthManager.REDIRECT_URI)) },
+                    contentPadding = PaddingValues(0.dp)
+                ) { Text("Copy redirect URI", color = Lw.Green, fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = valid,
+                onClick = { onSave(if (trimmed == builtIn) "" else trimmed) }
+            ) { Text("Save", color = if (valid) Lw.Green else Lw.TextMuted) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
